@@ -1,0 +1,53 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Build directories and CMake-generated files
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+/build.ninja
+/rules.ninja
+/.ninja_deps
+/.ninja_log
+/dynamorio/build.ninja
+/dynamorio/rules.ninja
+/dynamorio/.ninja_deps
+/dynamorio/.ninja_log
+
+# Compiled artifacts
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dll
+*.dylib
+*.exe
+
+# Generated traces, scans, and reports (keep documentation/examples trackable)
+/dynamic.csv
+/dynamic-*.csv
+/static.json
+/static-debug.json
+/static-*.json
+/report.txt
+/report-*.txt
+/coverage.json
+/coverage.csv
+/coverage.txt
+/coverage/
+/reports/
+
+# Temporary editor files
+*~
+*.swp
+*.swo
+.#*
+
