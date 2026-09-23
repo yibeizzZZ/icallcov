@@ -70,11 +70,17 @@ def load_dynamic(path: Path):
                 "caller_module, caller_offset, target_module, target_offset"
             )
 
+        has_test_name = "test_name" in reader.fieldnames
+
         for row in reader:
             caller_module = (row.get("caller_module") or "").strip()
             caller_offset_raw = (row.get("caller_offset") or "").strip()
             target_module = (row.get("target_module") or "").strip()
             target_offset_raw = (row.get("target_offset") or "").strip()
+
+            test_name = (
+                (row.get("test_name") or "").strip() if has_test_name else ""
+            )
 
             # Some resumed/older per-test traces may contain an embedded CSV
             # header row. Ignore those rows instead of treating
@@ -120,7 +126,13 @@ def load_dynamic(path: Path):
                 continue
 
             edges.setdefault(caller, {})
-            edges[caller][target] = edges[caller].get(target, 0) + 1
+            edge_info = edges[caller].setdefault(
+                target, {"count": 0, "tests": set()}
+            )
+            edge_info["count"] += 1
+
+            if test_name:
+                edge_info["tests"].add(test_name)
 
     return executed, edges, skipped_rows
 
@@ -271,6 +283,70 @@ def build_site_records(static_sites, binary, project_root, source_dirs, test_dir
     return records
 
 
+def build_edge_export(
+    project_sites,
+    project_covered,
+    records,
+    dynamic_edges,
+    binary,
+    target_cache,
+):
+    """Build a machine-readable record of observed runtime targets per
+    project callsite. This is strictly an observed edge set (from dynamic
+    tracing) and must not be mistaken for a complete/legal target set."""
+    export = []
+
+    for key in sorted(project_sites):
+        module, offset = key
+        record = records[key]
+
+        status = "observed" if key in project_covered else "unobserved"
+        targets_map = dynamic_edges.get(key, {})
+
+        targets = []
+
+        for (target_module, target_offset), info in sorted(
+            targets_map.items(),
+            key=lambda item: (item[0][0], item[0][1]),
+        ):
+            target_function = None
+            target_location = None
+
+            if binary is not None and binary.name == target_module:
+                cache_key = (target_module, target_offset)
+
+                if cache_key not in target_cache:
+                    target_cache[cache_key] = symbolize(binary, target_offset)
+
+                target_function, target_location = target_cache[cache_key]
+
+            targets.append(
+                {
+                    "target_module": target_module,
+                    "target_offset": f"0x{target_offset:x}",
+                    "target_function": target_function,
+                    "target_location": target_location,
+                    "total_hits": info["count"],
+                    "tests": sorted(info["tests"]),
+                }
+            )
+
+        export.append(
+            {
+                "caller_module": module,
+                "caller_offset": f"0x{offset:x}",
+                "caller_function": record.get("function"),
+                "caller_location": record.get("location"),
+                "instruction": record.get("instruction", ""),
+                "status": status,
+                "observed_target_count": len(targets),
+                "targets": targets,
+            }
+        )
+
+    return export
+
+
 def print_site(
     record,
     dynamic_edges=None,
@@ -310,10 +386,15 @@ def print_site(
                 f"target set): {len(targets)} unique"
             )
 
-            for (target_module, target_offset), count in sorted(
+            for (target_module, target_offset), info in sorted(
                 targets.items(),
-                key=lambda item: (-item[1], item[0][0], item[0][1]),
+                key=lambda item: (
+                    -item[1]["count"],
+                    item[0][0],
+                    item[0][1],
+                ),
             ):
+                count = info["count"]
                 target_line = (
                     f"    -> {target_module}+0x{target_offset:x} "
                     f"({count} hits)"
@@ -389,6 +470,15 @@ def main():
         "--show-targets",
         action="store_true",
         help="Print observed dynamic targets when target tracing is available",
+    )
+
+    parser.add_argument(
+        "--export-edges",
+        help=(
+            "Write a JSON file with one record per project callsite "
+            "listing its observed (not legal/complete) runtime targets, "
+            "aggregated hit counts, and observing tests"
+        ),
     )
 
     args = parser.parse_args()
@@ -477,6 +567,8 @@ def main():
 
     print()
 
+    target_cache = {}
+
     if project_uncovered:
         print("UNCOVERED PROJECT CALLSITES")
         print("-" * 48)
@@ -489,8 +581,6 @@ def main():
     if args.show_covered and project_covered:
         print("COVERED PROJECT CALLSITES")
         print("-" * 48)
-
-        target_cache = {}
 
         for key in sorted(project_covered):
             print_site(
@@ -517,6 +607,25 @@ def main():
                     print_site(records[key])
 
             print()
+
+    if args.export_edges:
+        edge_export = build_edge_export(
+            project_sites,
+            project_covered,
+            records,
+            dynamic_edges,
+            binary,
+            target_cache,
+        )
+
+        export_path = Path(args.export_edges)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with export_path.open("w", encoding="utf-8") as f:
+            json.dump(edge_export, f, indent=2)
+            f.write("\n")
+
+        print(f"Observed edge set written to: {export_path}")
 
 
 if __name__ == "__main__":
