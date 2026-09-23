@@ -45,9 +45,13 @@ compile_commands.json
 /coverage/
 /reports/
 
+# libuv test artifacts
+/fs_event_stop_in_cb.txt
+/test_file_*
+/watch_dir/
+
 # Temporary editor files
 *~
 *.swp
 *.swo
 .#*
-
