@@ -205,6 +205,7 @@ def run_test(
     binary: Path,
     drrun: Path,
     client: Path,
+    mode: str,
     cwd: Path,
     log_path: Path,
     timeout: float,
@@ -236,6 +237,8 @@ def run_test(
         str(drrun),
         "-c",
         str(client),
+        "-mode",
+        mode,
         "--",
         *app_args,
     ]
@@ -350,9 +353,19 @@ def main():
     )
 
     parser.add_argument(
+        "--mode",
+        choices=("fast", "edge"),
+        default="fast",
+        help="Tracing mode to request from the DynamoRIO client (default: fast)",
+    )
+
+    parser.add_argument(
         "--output-dir",
-        default="coverage/suite",
-        help="Directory for traces, logs, suite.csv, and summary.csv",
+        default=None,
+        help=(
+            "Directory for traces, logs, suite.csv, and summary.csv "
+            "(default: coverage/<mode>)"
+        ),
     )
 
     parser.add_argument(
@@ -390,7 +403,7 @@ def main():
     drrun = resolve_path(args.drrun)
     client = resolve_path(args.client)
     cwd = resolve_path(args.cwd)
-    output_dir = resolve_path(args.output_dir)
+    output_dir = resolve_path(args.output_dir or f"coverage/{args.mode}")
 
     for description, path in (
         ("test binary", binary),
@@ -448,6 +461,7 @@ def main():
 
     print(f"Discovered/selected tests: {len(tests)}")
     print(f"Binary: {binary}")
+    print(f"Mode: {args.mode}")
     print(f"Output: {output_dir}")
     print()
 
@@ -515,6 +529,7 @@ def main():
                 binary=binary,
                 drrun=drrun,
                 client=client,
+                mode=args.mode,
                 cwd=cwd,
                 log_path=log_path,
                 timeout=args.timeout,

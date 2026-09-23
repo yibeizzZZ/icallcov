@@ -271,7 +271,13 @@ def build_site_records(static_sites, binary, project_root, source_dirs, test_dir
     return records
 
 
-def print_site(record, dynamic_edges=None, show_targets=False):
+def print_site(
+    record,
+    dynamic_edges=None,
+    show_targets=False,
+    binary=None,
+    target_cache=None,
+):
     module = record["module"]
     offset = record["offset"]
     instruction = record.get("instruction", "")
@@ -295,14 +301,48 @@ def print_site(record, dynamic_edges=None, show_targets=False):
         key = (module, offset)
         targets = dynamic_edges.get(key, {})
 
-        for (target_module, target_offset), count in sorted(
-            targets.items(),
-            key=lambda item: (-item[1], item[0][0], item[0][1]),
-        ):
+        # Fast-mode traces never populate the edges map (their rows have no
+        # recorded target), so `targets` is simply empty here; that is
+        # expected and not an error.
+        if targets:
             print(
-                f"    -> {target_module}+0x{target_offset:x} "
-                f"({count} hits)"
+                f"    observed targets (dynamic, not a complete legal "
+                f"target set): {len(targets)} unique"
             )
+
+            for (target_module, target_offset), count in sorted(
+                targets.items(),
+                key=lambda item: (-item[1], item[0][0], item[0][1]),
+            ):
+                target_line = (
+                    f"    -> {target_module}+0x{target_offset:x} "
+                    f"({count} hits)"
+                )
+
+                target_function = None
+                target_location = None
+
+                if (
+                    target_cache is not None
+                    and binary is not None
+                    and binary.name == target_module
+                ):
+                    cache_key = (target_module, target_offset)
+
+                    if cache_key not in target_cache:
+                        target_cache[cache_key] = symbolize(
+                            binary, target_offset
+                        )
+
+                    target_function, target_location = target_cache[cache_key]
+
+                print(target_line)
+
+                if target_function:
+                    print(f"        {target_function}")
+
+                if target_location:
+                    print(f"        {target_location}")
 
 
 def main():
@@ -450,11 +490,15 @@ def main():
         print("COVERED PROJECT CALLSITES")
         print("-" * 48)
 
+        target_cache = {}
+
         for key in sorted(project_covered):
             print_site(
                 records[key],
                 dynamic_edges=dynamic_edges,
                 show_targets=args.show_targets,
+                binary=binary,
+                target_cache=target_cache,
             )
 
         print()
