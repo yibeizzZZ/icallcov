@@ -33,6 +33,7 @@ compile_commands.json
 
 # Generated traces, scans, and reports (keep documentation/examples trackable)
 /dynamic.csv
+/dynamic.*.csv
 /dynamic-*.csv
 /static.json
 /static-debug.json

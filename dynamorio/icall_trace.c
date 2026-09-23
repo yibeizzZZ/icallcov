@@ -1,261 +1,108 @@
 #include "dr_api.h"
 #include "drmgr.h"
 
-#include <stddef.h>
+#include "edge_trace.h"
+#include "fast_trace.h"
+#include "trace_common.h"
 
-/*
- * Fast callsite-coverage tracer.
- *
- * Goal:
- *   Record whether each indirect callsite executed at least once.
- *
- * This intentionally does NOT collect runtime call targets.  Keeping target
- * tracing out of the hot path makes this mode suitable for running large test
- * suites and timing-sensitive tests.
- *
- * The CSV keeps the existing four-column schema for compatibility with the
- * current run_suite.py/report.py pipeline.  target_module is written as
- * "<not-recorded>" and target_offset as 0x0.
- */
+#include <string.h>
 
-typedef struct site_state_t {
-    app_pc callsite;
-    volatile int covered;
-    struct site_state_t *next;
-} site_state_t;
+typedef enum { TRACE_FAST, TRACE_EDGE } trace_mode_t;
+static trace_mode_t mode = TRACE_FAST;
 
-static file_t log_file = INVALID_FILE;
-
-/*
- * This lock is used only while DynamoRIO is building/instrumenting code and
- * while maintaining the linked list of site metadata.  It is NOT taken on
- * every indirect-call execution.
- */
-static void *site_list_lock;
-static site_state_t *site_list;
-
-
-/*
- * Called from the instrumented application.
- *
- * Hot-path work is intentionally tiny: one atomic store.
- * Repeated executions of the same callsite simply write 1 again.
- */
 static void
-mark_covered(site_state_t *site)
+fail(const char *message)
 {
-    dr_atomic_store32(&site->covered, 1);
+    dr_fprintf(STDERR, "icallcov: %s\n", message);
+    /* Full DR exit is unsafe while dr_client_main is still initializing. */
+    dr_abort_with_code(1);
 }
 
-
 static void
-print_module_offset(app_pc pc)
+parse_arguments(int argc, const char *argv[])
 {
-    module_data_t *mod = dr_lookup_module(pc);
-
-    if (mod != NULL) {
-        const char *name = dr_module_preferred_name(mod);
-        size_t offset = (size_t)(pc - mod->start);
-
-        dr_fprintf(log_file,
-                   "%s,0x%zx",
-                   name != NULL ? name : "<unknown>",
-                   offset);
-
-        dr_free_module_data(mod);
-    } else {
-        dr_fprintf(log_file,
-                   "<unknown>,0x%zx",
-                   (size_t)(ptr_uint_t)pc);
+    /* argv[0] is the client library; no options means fast mode. */
+    if (argc == 1)
+        return;
+    if (argc == 3 && strcmp(argv[1], "-mode") == 0) {
+        if (strcmp(argv[2], "fast") == 0) {
+            mode = TRACE_FAST;
+            return;
+        }
+        if (strcmp(argv[2], "edge") == 0) {
+            mode = TRACE_EDGE;
+            return;
+        }
     }
+    fail("Usage: drrun -c libicall_trace.so [-mode fast|edge] -- program [args]");
 }
-
-
-static site_state_t *
-create_site_state(app_pc callsite)
-{
-    site_state_t *site;
-
-    site = (site_state_t *)dr_global_alloc(sizeof(site_state_t));
-    DR_ASSERT(site != NULL);
-
-    site->callsite = callsite;
-    site->covered = 0;
-
-    dr_mutex_lock(site_list_lock);
-
-    site->next = site_list;
-    site_list = site;
-
-    dr_mutex_unlock(site_list_lock);
-
-    return site;
-}
-
 
 static dr_emit_flags_t
-event_app_instruction(void *drcontext,
-                      void *tag,
-                      instrlist_t *bb,
-                      instr_t *instr,
-                      bool for_trace,
-                      bool translating,
-                      void *user_data)
+event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
+                      bool for_trace, bool translating, void *user_data)
 {
-    app_pc callsite;
-    site_state_t *site;
-
-    if (!instr_is_call_indirect(instr))
+    if (!instr_is_app(instr) || !instr_is_call_indirect(instr) ||
+        instr_get_app_pc(instr) == NULL)
         return DR_EMIT_DEFAULT;
 
-    callsite = instr_get_app_pc(instr);
-
-    if (callsite == NULL)
-        return DR_EMIT_DEFAULT;
-
-    /*
-     * A site_state_t is tied to this instrumentation instance.
-     *
-     * DynamoRIO may translate the same application address more than once,
-     * so duplicate metadata entries are possible.  That is harmless for V1:
-     * the CSV consumer already treats callsites as a set.
-     */
-    site = create_site_state(callsite);
-
-    /*
-     * Unlike dr_insert_mbr_instrumentation(), this does not compute or pass
-     * the runtime branch target.  We only pass a pointer to this callsite's
-     * metadata.
-     */
-    dr_insert_clean_call(
-        drcontext,
-        bb,
-        instr,
-        (void *)mark_covered,
-        false,
-        1,
-        OPND_CREATE_INTPTR(site)
-    );
-
+    /* Mode dispatch happens when instrumenting, not on every execution. */
+    if (mode == TRACE_FAST)
+        fast_trace_insert(drcontext, bb, instr);
+    else
+        edge_trace_insert(drcontext, bb, instr);
     return DR_EMIT_DEFAULT;
 }
 
-
 static void
-flush_covered_sites(void)
+event_fork(void *drcontext)
 {
-    site_state_t *site;
-
-    if (log_file == INVALID_FILE)
-        return;
-
-    dr_fprintf(
-        log_file,
-        "caller_module,caller_offset,"
-        "target_module,target_offset\n"
-    );
-
-    for (site = site_list; site != NULL; site = site->next) {
-        if (dr_atomic_load32(&site->covered) == 0)
-            continue;
-
-        print_module_offset(site->callsite);
-
-        /*
-         * Preserve the current CSV schema so run_suite.py/report.py can use
-         * this fast tracer without changes.
-         *
-         * Fast mode measures callsite coverage only.
-         */
-        dr_fprintf(
-            log_file,
-            ",<not-recorded>,0x0\n"
-        );
-    }
+    /* A fork inherits the parent's descriptor; exec instead reruns client init.
+     * Closing our copy leaves the parent's descriptor and trace untouched. */
+    trace_output_close();
+    if (!trace_output_open())
+        fail("could not create child trace file");
+    if (mode == TRACE_FAST)
+        fast_trace_fork();
 }
-
-
-static void
-free_site_list(void)
-{
-    site_state_t *site = site_list;
-
-    while (site != NULL) {
-        site_state_t *next = site->next;
-        dr_global_free(site, sizeof(site_state_t));
-        site = next;
-    }
-
-    site_list = NULL;
-}
-
 
 static void
 event_exit(void)
 {
-    flush_covered_sites();
-
-    if (log_file != INVALID_FILE) {
-        dr_close_file(log_file);
-        log_file = INVALID_FILE;
-    }
-
-    free_site_list();
-
-    if (site_list_lock != NULL) {
-        dr_mutex_destroy(site_list_lock);
-        site_list_lock = NULL;
-    }
-
+    drmgr_unregister_bb_insertion_event(event_app_instruction);
+    dr_unregister_fork_init_event(event_fork);
+    if (mode == TRACE_FAST)
+        fast_trace_exit();
+    else
+        edge_trace_exit();
+    trace_output_close();
     drmgr_exit();
 }
-
 
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-    char log_path[MAXIMUM_PATH];
-    process_id_t pid;
-
-    dr_set_client_name(
-        "icallcov fast indirect-callsite tracer",
-        "https://github.com/yibeizzZZ/icallcov"
-    );
-
+    dr_set_client_name("icallcov indirect-call tracer",
+                       "https://github.com/yibeizzZZ/icallcov");
+    parse_arguments(argc, argv);
     if (!drmgr_init())
-        DR_ASSERT(false);
+        fail("could not initialize drmgr");
+    if (!trace_output_open()) {
+        drmgr_exit();
+        fail("could not create trace file");
+    }
 
-    site_list_lock = dr_mutex_create();
-    site_list = NULL;
+    if (mode == TRACE_FAST)
+        fast_trace_init();
+    else
+        edge_trace_init();
 
-    /*
-     * One output file per process avoids parent/helper/child processes
-     * overwriting each other's traces.
-     */
-    pid = dr_get_process_id();
-
-    dr_snprintf(
-        log_path,
-        sizeof(log_path),
-        "dynamic.%d.csv",
-        (int)pid
-    );
-
-    log_path[sizeof(log_path) - 1] = '\0';
-
-    log_file = dr_open_file(
-        log_path,
-        DR_FILE_WRITE_OVERWRITE |
-        DR_FILE_ALLOW_LARGE
-    );
-
-    DR_ASSERT(log_file != INVALID_FILE);
-
-    drmgr_register_exit_event(event_exit);
-
-    drmgr_register_bb_instrumentation_event(
-        NULL,
-        event_app_instruction,
-        NULL
-    );
+    if (!drmgr_register_exit_event(event_exit)) {
+        event_exit();
+        fail("could not register exit callback");
+    }
+    dr_register_fork_init_event(event_fork);
+    if (!drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL)) {
+        event_exit();
+        fail("could not register instrumentation callback");
+    }
 }

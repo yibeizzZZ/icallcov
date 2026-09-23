@@ -4,7 +4,12 @@ project(icall_trace C)
 
 find_package(DynamoRIO REQUIRED)
 
-add_library(icall_trace SHARED icall_trace.c)
+add_library(icall_trace SHARED
+    icall_trace.c
+    trace_common.c
+    fast_trace.c
+    edge_trace.c
+)
 
 configure_DynamoRIO_client(icall_trace)
 
