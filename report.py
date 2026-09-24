@@ -200,7 +200,8 @@ def is_under(path, directory):
 def classify_site(function, location, instruction,
                   project_root=None,
                   source_dirs=None,
-                  test_dirs=None):
+                  test_dirs=None,
+                  libuv_compat=False):
     fn = (function or "").lower()
     loc = (location or "").lower()
     ins = (instruction or "").lower()
@@ -246,13 +247,23 @@ def classify_site(function, location, instruction,
     ):
         return "test"
 
-    if fn.startswith("uv_") or fn.startswith("uv__"):
+    # This is a libuv-specific fallback (its public/internal functions are
+    # named uv_*/uv__*) and is intentionally NOT part of generic
+    # classification; it only applies with --libuv-compat.
+    if libuv_compat and (fn.startswith("uv_") or fn.startswith("uv__")):
         return "project"
 
     return "unknown"
 
 
-def build_site_records(static_sites, binary, project_root, source_dirs, test_dirs):
+def build_site_records(
+    static_sites,
+    binary,
+    project_root,
+    source_dirs,
+    test_dirs,
+    libuv_compat=False,
+):
     records = {}
 
     for key, site in static_sites.items():
@@ -271,6 +282,7 @@ def build_site_records(static_sites, binary, project_root, source_dirs, test_dir
             project_root=project_root,
             source_dirs=source_dirs,
             test_dirs=test_dirs,
+            libuv_compat=libuv_compat,
         )
 
         records[key] = {
@@ -455,6 +467,17 @@ def main():
     )
 
     parser.add_argument(
+        "--libuv-compat",
+        action="store_true",
+        help=(
+            "Enable a libuv-specific classification fallback that treats "
+            "uv_*/uv__* function names as project code. Off by default; "
+            "generic classification relies on --project-root/--source-dir/"
+            "--test-dir instead."
+        ),
+    )
+
+    parser.add_argument(
         "--show-filtered",
         action="store_true",
         help="Print test, runtime, and unknown callsites after the main report",
@@ -516,6 +539,7 @@ def main():
         str(project_root) if project_root else None,
         source_dirs,
         test_dirs,
+        libuv_compat=args.libuv_compat,
     )
 
     categories = {

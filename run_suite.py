@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from runners import RUNNER_NAMES, build_runner
+
 
 TRACE_HEADER = [
     "caller_module",
@@ -35,65 +37,6 @@ def default_drrun() -> Path:
         )
 
     return resolve_path("~/tools/dynamorio/build/bin64/drrun")
-
-
-def parse_test_list(output: str):
-    tests = []
-
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        match = re.match(
-            r"^(\S+)(?:\s+\(helpers:\s*(.*?)\))?$",
-            line,
-        )
-
-        if not match:
-            continue
-
-        name = match.group(1)
-        helper_text = match.group(2)
-        helpers = helper_text.split() if helper_text else []
-
-        tests.append(
-            {
-                "name": name,
-                "helpers": helpers,
-            }
-        )
-
-    return tests
-
-
-def discover_tests(binary: Path):
-    proc = subprocess.run(
-        [str(binary), "--list"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "failed to list tests\n"
-            f"command: {binary} --list\n"
-            f"exit code: {proc.returncode}\n"
-            f"stderr:\n{proc.stderr}"
-        )
-
-    tests = parse_test_list(proc.stdout)
-
-    if not tests:
-        raise RuntimeError(
-            "test discovery returned no tests; "
-            "expected libuv-style `--list` output"
-        )
-
-    return tests
 
 
 def read_trace(trace_path: Path):
@@ -202,7 +145,7 @@ def write_summary(destination: Path, results):
 def run_test(
     *,
     test,
-    binary: Path,
+    app_command,
     drrun: Path,
     client: Path,
     mode: str,
@@ -215,24 +158,10 @@ def run_test(
 
     cleanup_pid_traces(cwd)
 
-    # IMPORTANT:
-    # Always invoke libuv through its normal test runner:
-    #
-    #     uv_run_tests_a TEST_NAME
-    #
-    # Do NOT use:
-    #
-    #     uv_run_tests_a TEST_NAME TEST_NAME
-    #
-    # The two-argument form calls run_test_part() directly and bypasses
-    # libuv's normal process/test-runner semantics. Some valid tests
-    # (for example fork_fs_events_child) can hang when invoked that way.
-    #
-    # Per-PID tracing means it is safe for the normal runner to create
-    # child/helper processes: DynamoRIO follows them and each process
-    # writes its own dynamic.<pid>.csv file.
-    app_args = [str(binary), name]
-
+    # The runner is responsible for returning the real test-executable
+    # invocation (see runners/base.py); per-PID tracing means it is safe
+    # for that invocation to spawn child/helper processes: DynamoRIO
+    # follows them and each process writes its own dynamic.<pid>.csv file.
     command = [
         str(drrun),
         "-c",
@@ -240,10 +169,11 @@ def run_test(
         "-mode",
         mode,
         "--",
-        *app_args,
+        *app_command,
     ]
 
     started = time.monotonic()
+
 
     try:
         proc = subprocess.run(
@@ -319,15 +249,44 @@ def run_test(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Run a libuv-style test suite under the icallcov DynamoRIO "
-            "client and aggregate per-process indirect-call traces."
+            "Run a test suite (via a pluggable runner adapter) under the "
+            "icallcov DynamoRIO client and aggregate per-process "
+            "indirect-call traces."
         )
     )
 
     parser.add_argument(
+        "--runner",
+        choices=RUNNER_NAMES,
+        default="libuv",
+        help=(
+            "Test-runner adapter to use (default: libuv, kept for "
+            "backward compatibility)"
+        ),
+    )
+
+    parser.add_argument(
         "--binary",
-        required=True,
-        help="Path to the test binary",
+        help="Path to the test binary (required for --runner libuv/gtest)",
+    )
+
+    parser.add_argument(
+        "--build-dir",
+        help="CMake build directory (required for --runner ctest)",
+    )
+
+    parser.add_argument(
+        "--ctest-bin",
+        default="ctest",
+        help="Path to the ctest executable (default: ctest)",
+    )
+
+    parser.add_argument(
+        "--tests-file",
+        help=(
+            "File of one test command per line "
+            "(required for --runner commands)"
+        ),
     )
 
     parser.add_argument(
@@ -349,7 +308,10 @@ def main():
     parser.add_argument(
         "--cwd",
         default=".",
-        help="Working directory for test execution",
+        help=(
+            "Working directory for test execution "
+            "(a runner may override this per test, e.g. CTest)"
+        ),
     )
 
     parser.add_argument(
@@ -399,17 +361,47 @@ def main():
 
     args = parser.parse_args()
 
-    binary = resolve_path(args.binary)
+    if args.runner in ("libuv", "gtest") and not args.binary:
+        print(
+            f"error: --binary is required for --runner {args.runner}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.runner == "ctest" and not args.build_dir:
+        print(
+            "error: --build-dir is required for --runner ctest",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.runner == "commands" and not args.tests_file:
+        print(
+            "error: --tests-file is required for --runner commands",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    binary = resolve_path(args.binary) if args.binary else None
+    build_dir = resolve_path(args.build_dir) if args.build_dir else None
+    tests_file = resolve_path(args.tests_file) if args.tests_file else None
     drrun = resolve_path(args.drrun)
     client = resolve_path(args.client)
     cwd = resolve_path(args.cwd)
     output_dir = resolve_path(args.output_dir or f"coverage/{args.mode}")
 
-    for description, path in (
-        ("test binary", binary),
-        ("drrun", drrun),
-        ("DynamoRIO client", client),
-    ):
+    path_checks = [("drrun", drrun), ("DynamoRIO client", client)]
+
+    if binary is not None:
+        path_checks.append(("test binary", binary))
+
+    if build_dir is not None:
+        path_checks.append(("build dir", build_dir))
+
+    if tests_file is not None:
+        path_checks.append(("tests file", tests_file))
+
+    for description, path in path_checks:
         if not path.exists():
             print(
                 f"error: {description} not found: {path}",
@@ -424,6 +416,18 @@ def main():
         )
         sys.exit(1)
 
+    try:
+        runner = build_runner(
+            args.runner,
+            binary=binary,
+            build_dir=build_dir,
+            ctest_bin=args.ctest_bin,
+            tests_file=tests_file,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     traces_dir = output_dir / "traces"
     logs_dir = output_dir / "logs"
 
@@ -431,7 +435,7 @@ def main():
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        tests = discover_tests(binary)
+        tests = runner.discover_tests()
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -460,7 +464,11 @@ def main():
         return
 
     print(f"Discovered/selected tests: {len(tests)}")
-    print(f"Binary: {binary}")
+    print(f"Runner: {args.runner}")
+
+    if binary is not None:
+        print(f"Binary: {binary}")
+
     print(f"Mode: {args.mode}")
     print(f"Output: {output_dir}")
     print()
@@ -524,17 +532,26 @@ def main():
         )
 
         try:
+            test_cwd = cwd
+            working_dir = runner.working_dir_for_test(test)
+
+            if working_dir:
+                test_cwd = resolve_path(working_dir)
+
+            app_command = runner.command_for_test(test)
+
             result = run_test(
                 test=test,
-                binary=binary,
+                app_command=app_command,
                 drrun=drrun,
                 client=client,
                 mode=args.mode,
-                cwd=cwd,
+                cwd=test_cwd,
                 log_path=log_path,
                 timeout=args.timeout,
             )
         except Exception as exc:
+            test_cwd = cwd
             result = {
                 "test_name": name,
                 "helpers": test["helpers"],
@@ -579,7 +596,7 @@ def main():
             f"{len(result['trace_files'])} process trace(s)"
         )
 
-        cleanup_pid_traces(cwd)
+        cleanup_pid_traces(test_cwd)
 
     suite_path = output_dir / "suite.csv"
     summary_path = output_dir / "summary.csv"
