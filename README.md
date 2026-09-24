@@ -140,6 +140,16 @@ Swap `--runner commands --tests-file my_tests.txt` for `--runner libuv --binary 
 
 ## Example: libuv
 
+For projects with multiple statically linked test executables, use
+`python3 run_project.py project.json --mode edge --output-dir coverage/project`.
+Each manifest target gets its own scan, suite trace, and report. The root
+`summary.csv`/`summary.json` lists per-binary coverage without merging offsets
+or claiming unique library-wide coverage. See the [libpng multi-binary
+example](examples/libpng.md) for the manifest contract, local smoke configuration
+commands, output layout, and limitations. Existing single-binary commands
+remain unchanged. `report.py --export-summary FILE` optionally exports the
+coverage counts for one binary as JSON.
+
 See [examples/libuv.md](examples/libuv.md) for a debug build and a `run_suite.py --runner libuv` run of the `timer` test. The supplied prototype observation was 11 covered project callsites out of 62 (17.7%). This is environment/test-specific, **not whole-libuv test-suite coverage**.
 
 ## Output

@@ -455,6 +455,15 @@ def print_site(
                     print(f"        {target_location}")
 
 
+def coverage_summary(static_sites, project_sites, dynamic_sites):
+    """Counts for one binary; keys retain their (module, offset) identity."""
+    covered = len(project_sites & dynamic_sites)
+    total = len(project_sites)
+    return {"raw_static": len(static_sites), "static": total,
+            "covered": covered, "uncovered": total - covered,
+            "coverage": covered / total * 100.0 if total else 0.0}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -521,6 +530,7 @@ def main():
         ),
     )
 
+    parser.add_argument("--export-summary", help="Write per-binary coverage counts as JSON")
     args = parser.parse_args()
 
     static_path = Path(args.static_json)
@@ -583,6 +593,13 @@ def main():
     project_sites = categories["project"]
     project_covered = project_sites & dynamic_sites
     project_uncovered = project_sites - dynamic_sites
+
+    if args.export_summary:
+        summary_path = Path(args.export_summary)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(coverage_summary(
+            static_sites, project_sites, dynamic_sites), indent=2) + "\n",
+            encoding="utf-8")
 
     raw_total = len(static_sites)
     project_total = len(project_sites)

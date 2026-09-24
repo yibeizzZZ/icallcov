@@ -47,10 +47,17 @@ compile_commands.json
 /coverage/
 /reports/
 
+# Local libpng experiment manifests and command lists (machine-specific paths)
+/examples/libpng/
+
 # libuv test artifacts
 /fs_event_stop_in_cb.txt
 /test_file_*
 /watch_dir/
+/watch_file
+
+# Local editor configuration
+/.vscode/
 
 # Temporary editor files
 *~
