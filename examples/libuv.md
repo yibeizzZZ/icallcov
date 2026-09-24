@@ -42,7 +42,7 @@ python3 run_suite.py \
   --output-dir coverage/edge
 ```
 
-This invokes the test the same way libuv's own runner does — `uv_run_tests_a timer` (never the two-argument `uv_run_tests_a timer timer` form, which bypasses libuv's normal process/test-runner semantics and can hang some tests). Each traced process writes its own `dynamic.<pid>.csv`; `run_suite.py` collects and merges those per-process files into `coverage/edge/traces/timer.csv` and the suite-wide `coverage/edge/suite.csv` (with a `test_name` column), and writes `coverage/edge/summary.csv`. Use `--mode fast` instead of `--mode edge` for lower-overhead callsite-only coverage (no observed-target data). Drop `--match '^timer$'` to run the whole discovered test list.
+This invokes the test the same way libuv's own runner does — `uv_run_tests_a timer` (never the two-argument `uv_run_tests_a timer timer` form, which bypasses libuv's normal process/test-runner semantics and can hang some tests). Each traced process writes its own `dynamic.<pid>.csv`; `run_suite.py` collects and merges those per-process files into a CSV under `coverage/edge/traces/` whose filename combines `timer` with a hash of the test name, and into the suite-wide `coverage/edge/suite.csv` (with a `test_name` column). It also writes per-test JSON metadata and `coverage/edge/summary.csv`. Use `--mode fast` instead of `--mode edge` for lower-overhead callsite-only coverage (no observed-target data). Drop `--match '^timer$'` to run the whole discovered test list.
 
 ## 4. Generate the report
 

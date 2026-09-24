@@ -4,7 +4,7 @@
 
 icallcov is a prototype tool for measuring indirect-call coverage in native programs by combining static binary discovery with dynamic test execution tracing.
 
-**icallcov core is project-agnostic.** It works on any Linux x86-64 ELF C/C++ binary:
+**icallcov core is project-agnostic.** The supported workflow is a single main Linux x86-64 ELF executable, built as PIE or non-PIE, with tests that invoke native executables directly. Debug information is strongly recommended for source classification and symbolization. Within that scope, it:
 
 - statically discovers indirect callsites (`scan.py`),
 - traces indirect calls executed under DynamoRIO in `fast` (callsite-only) or `edge` (callsite + observed target) mode,
@@ -34,10 +34,16 @@ Native programs use indirect calls for callbacks, function pointers, and other f
    coverage = executed project callsites / all discovered project callsites × 100%
    ```
 
-6. When debug information is available, `addr2line` maps binary offsets back to source functions, files, and lines to support classification and inspection.
+6. When debug information is available, `addr2line` maps ELF virtual addresses back to source functions, files, and lines to support classification and inspection.
 7. In `edge` mode, `report.py --show-targets`/`--export-edges` reports the runtime targets *observed* at each covered callsite, symbolized the same way.
 
-**Classification is generic by default**: it uses runtime-name patterns (glibc/loader internals), `--project-root`/`--source-dir`/`--test-dir`, and a small path-based fallback (`test-*` filenames, `/test/`/`/tests/` directories). It does **not** classify arbitrary `uv_*`/`uv__*`-style names as project code unless you explicitly opt in with `--libuv-compat`. Review filtered callsites when interpreting results. If no project callsites are identified, the current report prints `0.0%`.
+**Classification is generic by default**: explicit `--project-root`/`--source-dir`/`--test-dir` matches take precedence over runtime-name heuristics. Outside those directories, it checks runtime symbols and a small path-based fallback (`test-*` filenames, `/test/`/`/tests/` directories). `_start` is an exact symbol match; a project function named `worker_start` is not excluded just because its name contains `_start`. It does **not** classify arbitrary `uv_*`/`uv__*`-style names as project code unless you explicitly opt in with `--libuv-compat`. Review filtered callsites when interpreting results. If no project callsites are identified, the current report prints `0.0%`.
+
+### Address coordinates
+
+Static callsites and dynamic callers/targets use the same **module-relative offset**. For Linux x86-64 ELF, the image base is the lowest `PT_LOAD` virtual address rounded down to a 4096-byte page. `scan.py` subtracts that base from the virtual addresses printed by `objdump`; the tracer records `PC - module start`. These coordinates match for both PIE and non-PIE binaries. Before calling `addr2line`, the report adds the ELF image base back to main-binary caller and target offsets.
+
+Static JSON records `"address_coordinate": "module-relative"` and an integer `"elf_image_base"`. Older static JSON lacks this metadata and is rejected with an instruction to regenerate it using `scan.py`. Regenerate scans after upgrading, and always scan, trace, and symbolize the same binary build. A report also rejects a supplied binary whose ELF image base differs from the scan metadata; this check is not a complete binary identity check.
 
 ## Tracing Modes
 
@@ -50,13 +56,19 @@ Both modes produce the same trace CSV shape (`caller_module,caller_offset,target
 
 ## Multi-Process Tracing and Suite Aggregation
 
-Each traced process writes its own `dynamic.<pid>.csv` in its working directory (DynamoRIO instruments the process it's attached to, and per-PID files avoid clobbering when a test forks/execs helper or child processes). `run_suite.py`:
+Each traced process writes `dynamic.<pid>.csv` in its working directory. Separate PIDs have separate files; an `exec` that retains its PID can overwrite an earlier trace (see [Current Limitations](#current-limitations)). `run_suite.py`:
 
-- runs one test at a time, collects all `dynamic.<pid>.csv` files written during that test, and merges them into a single per-test trace under `<output-dir>/traces/<test>.csv`,
-- deletes the raw per-PID files after collecting them so the next test starts clean,
+- runs one test at a time under an advisory lock for its working directory, and stops its process group before collecting traces, including after timeouts,
+- temporarily sets aside preexisting `dynamic.<pid>.csv` files, collects the new traces into `<output-dir>/traces/<stem>.csv`, and restores the original files after cleanup (including when a PID filename is reused),
+- deletes only the newly collected raw per-PID files,
 - appends every per-test row (tagged with `test_name`) into a suite-wide `<output-dir>/suite.csv`,
-- writes one summary row per test (status, duration, trace/callsite counts, process-trace count) to `<output-dir>/summary.csv`,
-- supports `--resume` to skip tests whose per-test CSV already exists (for re-running a suite after a partial failure).
+- writes one summary row per test (status, duration, trace/callsite counts, process-trace count, and a `resumed` flag) to `<output-dir>/summary.csv`,
+- writes per-test JSON metadata alongside each trace, and supports `--resume` only for matching, previously passed results with an intact trace,
+- exits with a nonzero status if any test fails or times out.
+
+The per-test filename stem combines a readable, sanitized test-name prefix with the first 20 hexadecimal characters of the test name's SHA-256 digest. Names such as `A/B` and `A:B` therefore have distinct artifacts even if their readable prefixes match.
+
+Resume validates the trace hash and saved execution identity: runner, tracing mode, test, command arguments, executable path/content, working directory, client and `drrun` paths/content, environment digest, and timeout. A resumed result keeps its original `passed` status and sets `resumed` to true. Failed or timed-out tests, changed inputs, missing metadata, and damaged traces rerun. Older filename-only caches are not sufficient for resume. This does not fingerprint arbitrary input files, shared libraries, or other external state used by a test; rerun without `--resume` when those change.
 
 `suite.csv` is what you normally pass to `report.py`; it is a superset of a single-test `dynamic.csv` with an added `test_name` column, and `report.py` uses that column (when present) to record which tests observed each edge in `--export-edges` output.
 
@@ -66,15 +78,16 @@ Each traced process writes its own `dynamic.<pid>.csv` in its working directory 
 
 - **`libuv`** (default, for backward compatibility) — discovers tests via `<binary> --list` and runs each one as `<binary> TEST_NAME`. Preserved from the original prototype.
 - **`gtest`** — for GoogleTest-compatible binaries. Discovers tests via `<binary> --gtest_list_tests` and runs each one as `<binary> --gtest_filter=Suite.Case`.
-- **`commands`** — universal fallback for any project. Reads one test command per line from `--tests-file` (blank lines and `#` comments ignored; optional `NAME<TAB>COMMAND` form for explicit names; otherwise a deterministic name is derived from the command). Commands are parsed with `shlex.split`, not a shell.
-- **`ctest`** — for CMake/CTest projects, given `--build-dir`. Test names come from `ctest --show-only=json-v1` (CMake/CTest ≥ 3.14 required), and **each test is executed by running its resolved `command` directly under DynamoRIO**, not by wrapping `ctest` itself — wrapping `ctest` does not reliably propagate instrumentation into the child test binary it spawns. **Limitation:** this only works when a test's resolved `command` is the real test executable (the common `add_test(... COMMAND <exe> ...)` case); if a project wraps tests in a launcher/emulator, or its CTest predates `--show-only=json-v1`, resolution fails with an explicit error instead of silently tracing the wrong process — use the `commands` runner with an explicit invocation of the real binary in that case.
+- **`commands`** — explicit native test invocations. Reads one test command per line from `--tests-file` (blank lines and `#` comments ignored; optional `NAME<TAB>COMMAND` form for explicit names; otherwise a deterministic name is derived from the command). Commands are parsed with `shlex.split`, not a shell.
+- **`ctest`** — for CMake/CTest projects, given `--build-dir`. Test names and commands come from `ctest --show-only=json-v1` (CMake/CTest ≥ 3.14 required). The adapter executes each command directly under DynamoRIO and honors its working directory. This supports simple `add_test(... COMMAND <exe> ...)` cases. It does not reproduce CTest's full execution semantics, including fixtures, dependencies, environment properties, or expected-failure rules. It does not reliably detect launchers/emulators; inspect the resolved command and use `commands` with an explicit native executable when needed.
 
 icallcov does not claim to support every C/C++ test framework. For anything not listed above, use the `commands` runner, or add a new adapter implementing `runners/base.py:TestRunner` (discover_tests, command_for_test, and the optional working_dir_for_test).
 
 ## Requirements
 
-- Linux on x86-64, with ELF binaries to analyze.
-- Python 3 (the scripts use the standard library).
+- Linux on x86-64, with one main ELF executable to analyze (PIE or non-PIE).
+- Debug information strongly recommended; tests should invoke native executables directly.
+- Python 3.8 or newer (the scripts use the standard library).
 - GNU binutils: `objdump` and `addr2line`.
 - A C compiler and CMake 3.14 or newer.
 - DynamoRIO, installed separately, including its CMake package and `drmgr` extension.
@@ -131,8 +144,8 @@ See [examples/libuv.md](examples/libuv.md) for a debug build and a `run_suite.py
 
 ## Output
 
-- `static.json` (or the filename supplied with `-o`): binary path, module name, callsite count, and indirect-callsite records containing module, numeric offset, hexadecimal offset, and instruction text. Without `-o`, the scanner prints a summary but does not save JSON.
-- `<output-dir>/traces/<test>.csv`, `<output-dir>/suite.csv`: one row per recorded indirect-call event, with this header (`suite.csv` adds a leading `test_name` column):
+- `static.json` (or the filename supplied with `-o`): binary path, module name, `address_coordinate`, `elf_image_base`, callsite count, and indirect-callsite records containing module, numeric module-relative offset, hexadecimal offset, and instruction text. Without `-o`, the scanner prints a summary but does not save JSON.
+- `<output-dir>/traces/<stem>.csv`, `<output-dir>/suite.csv`: covered callsite rows in fast mode (duplicates are possible), or executed callsite-to-target events in edge mode, with this header (`suite.csv` adds a leading `test_name` column):
 
   ```csv
   caller_module,caller_offset,target_module,target_offset
@@ -140,20 +153,29 @@ See [examples/libuv.md](examples/libuv.md) for a debug build and a `run_suite.py
 
   In `fast` mode, `target_module`/`target_offset` are the placeholder `<not-recorded>`/`0x0`; in `edge` mode they are the actual observed runtime target.
 
-- `<output-dir>/summary.csv`: one row per test with status, return code, duration, trace-event/unique-callsite counts, and per-process trace count.
+- `<output-dir>/traces/<stem>.json`: execution identity, trace hash, and result details used to validate resume; it shares its filename stem with the corresponding CSV.
+- `<output-dir>/summary.csv`: one row per test with status, return code, duration, trace-event/unique-callsite counts, per-process trace count, and `resumed`. Resuming a passed test preserves its `passed` status.
 - Report on standard output: raw callsite count, category counts, project coverage, and uncovered project callsites. Optional flags show covered sites, observed target hit counts, and filtered categories. For a saved report, redirect standard output to `report.txt`.
 - `--export-edges`: a JSON file with one record per project callsite (`caller_module`, `caller_offset`, `caller_function`, `caller_location`, `instruction`, `status`, `observed_target_count`, `targets`); each target has `target_module`, `target_offset`, `target_function`, `target_location`, `total_hits`, and the `tests` that observed it.
 
 **Observed target hit counts and the `--export-edges` output describe only what the traced run(s) executed. They are not a complete or legal target set** — full legal-target / indirect-edge coverage analysis (e.g. comparing against a CFI policy) is future work.
 
+## Optional LLVM IR Scanner
+
+An independent [LLVM IR callsite scanner](llvm/README.md) reads `.ll`/`.bc` using `CallBase::isIndirectCall()` and emits artifact-local unique IDs, owning functions, debug source locations, and an explicit `not_analyzed` target-analysis placeholder. It requires LLVM 21.1.x and builds separately. See the linked guide for commands and the sample input.
+
+The existing binary scanner and coverage workflow remain unchanged. IR output is not accepted by `report.py`: static callee estimation and IR-to-runtime address mapping are not implemented yet.
+
 ## Current Limitations
 
-- The prototype targets Linux x86-64 ELF binaries and depends on the instruction text emitted by `objdump`; it is not a complete binary-analysis framework.
+- The prototype supports one main Linux x86-64 ELF executable (PIE or non-PIE), simple native test execution, and the instruction text emitted by `objdump`; it is not a complete binary-analysis framework.
 - Callsite coverage measures execution of the instruction at least once, not coverage of all legal targets or indirect edges. Observed dynamic targets are not a legal/complete target set.
 - Classification is heuristic and depends on debug information and directory settings. Missing or incomplete symbols can leave sites unknown or misclassified; unknown sites are excluded from project coverage. The `--libuv-compat` fallback is libuv-specific and off by default.
-- Static addresses come directly from `objdump`, while dynamic offsets are relative to loaded module bases. The prototype does not normalize all ELF layouts (for example, non-PIE executables with a nonzero image base); verify address correspondence before interpreting coverage.
-- Module matching uses basenames, which can be ambiguous. A scan/report invocation corresponds to one main analyzed executable; observed dynamic edges into shared libraries may still be recorded, but whole-program shared-library static scanning is out of scope for now.
-- The `ctest` runner depends on `ctest --show-only=json-v1` resolving each test's real executable command; it does not work for CTest configurations that wrap tests in a launcher/emulator or predate that CMake version (see [Runner Support](#runner-support)).
+- **Shared libraries and module identity:** module matching uses basenames, while runtime preferred names can differ from on-disk names, including SONAME differences. Unloading a library with `dlclose` can also prevent reliable attribution of buffered addresses. Shared-library targets may be recorded, but complete shared-library coverage, unload-safe attribution, and robust module identity are outside the supported scope.
+- **Same-PID `exec`:** a replacement process image can reopen and overwrite `dynamic.<pid>.csv`, losing events from before `exec`. Per-PID aggregation does not solve this.
+- **Complex CTest execution:** the adapter directly executes discovered commands; it does not implement CTest fixtures, dependencies, environment properties, expected-failure semantics, or reliable launcher/emulator detection. Use only simple native commands whose behavior does not depend on those features (see [Runner Support](#runner-support)).
+- **Process and trace ownership:** cleanup covers the test's process group. Descendants that detach or escape with `setsid` are unsupported. The working-directory lock coordinates cooperating suite runs; concurrent external tracers that ignore it cannot safely share that directory. Preexisting trace files are excluded from collection and cleanup.
+- **Resume scope:** execution identity and trace hashes protect against stale or corrupted cached results, but do not cover changes to arbitrary test data, loaded dependencies, or external services.
 - Results depend on the binary build and the exact tests executed. They do not prove correctness, security, or complete test coverage.
 
 ## Roadmap
@@ -161,7 +183,7 @@ See [examples/libuv.md](examples/libuv.md) for a debug build and a `run_suite.py
 Future work, not current capabilities:
 
 - Model legal targets and compare them with observed callsite-to-target edges.
-- Improve address normalization and module identity across binary layouts.
+- Improve shared-library module identity, unload handling, and same-PID `exec` trace preservation.
 - Add more runner adapters, and a more robust CTest executable-resolution strategy.
 - Evaluate additional projects and document reproducible experiments.
 
@@ -170,6 +192,7 @@ Future work, not current capabilities:
 ```text
 icallcov/
 ├── scan.py
+├── elf_addresses.py
 ├── run_suite.py
 ├── report.py
 ├── runners/
@@ -180,9 +203,23 @@ icallcov/
 │   └── commands.py
 ├── dynamorio/
 │   ├── icall_trace.c
+│   ├── trace_common.c / trace_common.h
+│   ├── fast_trace.c / fast_trace.h
+│   ├── edge_trace.c / edge_trace.h
+│   ├── tests/
 │   └── CMakeLists.txt
+├── tests/
+│   ├── test_addresses.py
+│   ├── test_suite.py
+│   └── test_llvm_scanner.py
+├── llvm/
+│   ├── icall_ir_scan.cpp
+│   ├── CMakeLists.txt
+│   ├── README.md
+│   └── tests/callsites.ll
 ├── examples/
-│   └── libuv.md
+│   ├── libuv.md
+│   └── ir_callbacks.c
 ├── README.md
 ├── REQUIREMENTS.md
 ├── LICENSE

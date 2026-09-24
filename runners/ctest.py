@@ -8,17 +8,13 @@ invocation command via `ctest --show-only=json-v1` (CMake/CTest >= 3.14)
 and runs that resolved command directly under drrun, instead of wrapping
 `ctest -R '^NAME$'`.
 
-This is reliable for the common case of plain `add_test(NAME ... COMMAND
-<exe> ...)` entries. It is NOT reliable, and will raise a clear error
-instead of silently mis-tracing, when:
-
-- CTest/CMake predates `--show-only=json-v1` support, or
-- a test's resolved "command" is itself a wrapper/launcher (for example a
-  cross-compilation emulator or custom test driver) rather than the real
-  test binary.
-
-In either case, use the `commands` runner with an explicit invocation of
-the real test binary instead.
+This supports simple `add_test(NAME ... COMMAND <exe> ...)` entries and
+honors their working directory. It does not reproduce CTest fixtures,
+dependencies, environment properties, or expected-failure semantics.
+Commands that invoke wrappers, launchers, or emulators are not reliably
+detected and are outside the supported scope. Use the `commands` runner
+with an explicit native executable when needed. Older CTest versions
+without `--show-only=json-v1` support fail discovery with an error.
 """
 
 import json

@@ -34,6 +34,7 @@ compile_commands.json
 # Generated traces, scans, and reports (keep documentation/examples trackable)
 /dynamic.csv
 /dynamic.*.csv
+.icallcov-trace.lock
 /dynamic-*.csv
 /static.json
 /static-debug.json

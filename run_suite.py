@@ -2,11 +2,19 @@
 
 import argparse
 import csv
+import fcntl
+import hashlib
+import json
+import math
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from runners import RUNNER_NAMES, build_runner
@@ -22,6 +30,113 @@ TRACE_HEADER = [
 
 def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+
+def trace_stem(name: str) -> str:
+    # Keep the original name in the digest: foo/bar and foo_bar differ.
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+    return f"{safe_name(name)[:80]}-{digest}"
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def executable_identity(path: Path):
+    return {"path": str(path.resolve()), "sha256": file_digest(path)}
+
+
+def resolve_executable(command, cwd):
+    if not command:
+        raise ValueError("empty test command")
+    command = [str(arg) for arg in command]
+    if "/" in command[0]:
+        executable = Path(command[0])
+        if not executable.is_absolute():
+            executable = cwd / executable
+    else:
+        # Resolve relative PATH entries against the test's working directory,
+        # just as exec would, rather than against the suite driver's cwd.
+        search_path = os.pathsep.join(
+            str(Path(entry) if os.path.isabs(entry) else cwd / entry)
+            for entry in os.get_exec_path()
+        )
+        found = shutil.which(command[0], path=search_path)
+        if found is None:
+            raise FileNotFoundError(f"test executable not found: {command[0]}")
+        executable = Path(found)
+    # This path is for fingerprinting only. Execute the original argv: even
+    # dereferencing a symlink can change argv[0] and multicall-program behavior.
+    return executable
+
+
+def trace_identity(test, runner, mode, command, cwd, client, drrun, timeout):
+    # Store only a digest of the environment: it may contain credentials.
+    environment = json.dumps(sorted(os.environ.items()), ensure_ascii=True)
+    return {
+        "test_name": test["name"],
+        "helpers": test["helpers"],
+        "runner": runner,
+        "mode": mode,
+        "command": command,
+        "executable": executable_identity(resolve_executable(command, cwd)),
+        "cwd": str(cwd),
+        "client": executable_identity(client),
+        "drrun": executable_identity(drrun),
+        "environment_sha256": hashlib.sha256(environment.encode()).hexdigest(),
+        "timeout": timeout,
+    }
+
+
+def load_resume(metadata_path, trace_path, identity):
+    try:
+        with metadata_path.open(encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        if (metadata.get("version") != 1 or metadata.get("identity") != identity
+                or metadata.get("trace_sha256") != file_digest(trace_path)):
+            return None
+        result = metadata["result"]
+        if (result["status"] != "passed" or type(result["returncode"]) is not int
+                or result["returncode"] != 0
+                or result["test_name"] != identity["test_name"]
+                or result["helpers"] != identity["helpers"]):
+            return None
+        if any(type(result[key]) is not int or result[key] < 0 for key in
+               ("process_traces", "trace_events", "unique_callsites")):
+            return None
+        duration = result["duration_seconds"]
+        if (type(duration) not in (int, float) or not math.isfinite(duration)
+                or duration < 0 or result["process_traces"] < 1):
+            return None
+        rows = read_trace(trace_path)
+        unique = len({(row["caller_module"], row["caller_offset"]) for row in rows})
+        if len(rows) != result["trace_events"] or unique != result["unique_callsites"]:
+            return None
+        return {**result, "rows": rows, "resumed": True}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, csv.Error):
+        # Old CSVs, interrupted writes and incompatible records require a run.
+        return None
+
+
+def save_metadata(path, trace_path, identity, result):
+    metadata = {
+        "version": 1,
+        "identity": identity,
+        "trace_sha256": file_digest(trace_path),
+        "result": {key: result[key] for key in (
+            "test_name", "helpers", "status", "returncode", "duration_seconds",
+            "trace_events", "unique_callsites", "process_traces",
+        )},
+    }
+    temporary = path.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2)
+        stream.write("\n")
+    temporary.replace(path)
 
 
 def resolve_path(value: str) -> Path:
@@ -46,7 +161,7 @@ def read_trace(trace_path: Path):
         reader = csv.DictReader(f)
 
         if reader.fieldnames is None:
-            return []
+            raise ValueError(f"{trace_path} has no CSV header")
 
         missing = set(TRACE_HEADER) - set(reader.fieldnames)
 
@@ -57,6 +172,10 @@ def read_trace(trace_path: Path):
             )
 
         for row in reader:
+            if None in row or any(not row.get(key) for key in TRACE_HEADER):
+                raise ValueError(f"{trace_path} contains an incomplete CSV row")
+            int(row["caller_offset"], 0)
+            int(row["target_offset"], 0)
             rows.append(
                 {
                     key: row[key]
@@ -77,8 +196,9 @@ def collect_pid_traces(cwd: Path):
     return trace_files, rows
 
 
-def cleanup_pid_traces(cwd: Path):
-    for trace_path in cwd.glob("dynamic.*.csv"):
+def cleanup_pid_traces(trace_files):
+    # Delete only files owned by this run, never every trace in the cwd.
+    for trace_path in trace_files:
         try:
             trace_path.unlink()
         except FileNotFoundError:
@@ -88,10 +208,12 @@ def cleanup_pid_traces(cwd: Path):
 def write_test_trace(destination: Path, rows):
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    with destination.open("w", encoding="utf-8", newline="") as f:
+    temporary = destination.with_suffix(".csv.tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=TRACE_HEADER)
         writer.writeheader()
         writer.writerows(rows)
+    temporary.replace(destination)
 
 
 def write_suite_trace(destination: Path, suite_rows):
@@ -117,6 +239,7 @@ def write_summary(destination: Path, results):
         "unique_callsites",
         "process_traces",
         "helpers",
+        "resumed",
     ]
 
     with destination.open("w", encoding="utf-8", newline="") as f:
@@ -138,8 +261,87 @@ def write_summary(destination: Path, results):
                     "unique_callsites": result["unique_callsites"],
                     "process_traces": result["process_traces"],
                     "helpers": " ".join(result["helpers"]),
+                    "resumed": result.get("resumed", False),
                 }
             )
+
+
+class TraceIsolationError(RuntimeError):
+    """The suite must stop rather than let a process leak into the next test."""
+
+
+@contextmanager
+def trace_workspace(cwd):
+    # This lock coordinates icallcov suites sharing a cwd. Never unlink the
+    # lock file: another suite could otherwise lock a different inode.
+    with (cwd / ".icallcov-trace.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise TraceIsolationError(f"another suite is tracing in {cwd}") from exc
+        # Preserve old traces outside the tracer's filename namespace while
+        # running. A reused PID can then neither overwrite an old trace nor
+        # cause us to mistake its new output for an old file.
+        existing = list(cwd.glob("dynamic.*.csv"))
+        backup = Path(tempfile.mkdtemp(prefix=".icallcov-preserved-", dir=cwd))
+        moved = []
+        ready = False
+        try:
+            for path in existing:
+                path.rename(backup / path.name)
+                moved.append(path)
+            ready = True
+            yield
+        finally:
+            try:
+                try:
+                    if ready:
+                        cleanup_pid_traces(cwd.glob("dynamic.*.csv"))
+                finally:
+                    for path in moved:
+                        (backup / path.name).replace(path)
+                    backup.rmdir()
+            except OSError as exc:
+                raise TraceIsolationError(
+                    f"trace cleanup/restoration failed in {cwd}; "
+                    f"preserved files may remain in {backup}: {exc}"
+                ) from exc
+
+
+def group_is_running(pgid):
+    # Linux /proc lets us distinguish surviving writers from unreaped zombies.
+    # killpg(pgid, 0) alone considers zombies alive indefinitely.
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) == pgid and fields[0] not in ("Z", "X"):
+                return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return False
+
+
+def stop_process_group(proc):
+    # start_new_session makes the child PID its session and process-group ID.
+    # Also remove residual children after normal leader exit, before collecting.
+    for sig, grace in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            proc.wait()
+            return
+        deadline = time.monotonic() + grace
+        while True:
+            proc.poll()  # Reap the leader; orphan zombies cannot write traces.
+            if not group_is_running(proc.pid):
+                proc.wait()
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+    raise TraceIsolationError(f"cannot stop test process group {proc.pid}; aborting suite")
 
 
 def run_test(
@@ -155,95 +357,55 @@ def run_test(
 ):
     name = test["name"]
     helpers = test["helpers"]
-
-    cleanup_pid_traces(cwd)
-
-    # The runner is responsible for returning the real test-executable
-    # invocation (see runners/base.py); per-PID tracing means it is safe
-    # for that invocation to spawn child/helper processes: DynamoRIO
-    # follows them and each process writes its own dynamic.<pid>.csv file.
-    command = [
-        str(drrun),
-        "-c",
-        str(client),
-        "-mode",
-        mode,
-        "--",
-        *app_command,
-    ]
-
+    command = [str(drrun), "-c", str(client), "-mode", mode, "--", *app_command]
     started = time.monotonic()
+    timed_out = False
 
+    with trace_workspace(cwd):
+        # Files avoid communicate() hanging on pipes inherited by descendants.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out, \
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
+            proc = subprocess.Popen(command, cwd=cwd, stdout=out, stderr=err,
+                                    start_new_session=True)
+            try:
+                proc.wait(timeout=timeout if timeout > 0 else None)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                try:
+                    stop_process_group(proc)
+                except Exception as exc:
+                    raise TraceIsolationError(
+                        f"process-group cleanup failed for {proc.pid}: {exc}"
+                    ) from exc
+            out.seek(0)
+            err.seek(0)
+            stdout, stderr = out.read(), err.read()
 
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout if timeout > 0 else None,
-            check=False,
-        )
-
+        # Collection is allowed only after the entire test group has stopped.
+        trace_files, rows = collect_pid_traces(cwd)
         duration = time.monotonic() - started
-        returncode = proc.returncode
-        timed_out = False
-        stdout = proc.stdout
-        stderr = proc.stderr
+        returncode = None if timed_out else proc.returncode
+        status = "timeout" if timed_out else ("passed" if returncode == 0 else "failed")
+        if status == "passed" and not trace_files:
+            status = "runner-error"
+            stderr += "\nicallcov: test produced no per-process trace files\n"
 
-    except subprocess.TimeoutExpired as exc:
-        duration = time.monotonic() - started
-        returncode = None
-        timed_out = True
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as stream:
+            stream.write(f"test: {name}\nhelpers: {' '.join(helpers)}\n")
+            stream.write(f"command: {' '.join(command)}\nreturncode: {returncode}\n")
+            stream.write(f"timed_out: {timed_out}\nduration_seconds: {duration:.3f}\n")
+            stream.write(f"process_traces: {len(trace_files)}\n")
+            for path in trace_files:
+                stream.write(f"trace_file: {path.name}\n")
+            stream.write(f"\n===== STDOUT =====\n{stdout}\n===== STDERR =====\n{stderr}")
 
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-
-    trace_files, rows = collect_pid_traces(cwd)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with log_path.open("w", encoding="utf-8") as f:
-        f.write(f"test: {name}\n")
-        f.write(f"helpers: {' '.join(helpers)}\n")
-        f.write(f"command: {' '.join(command)}\n")
-        f.write(f"returncode: {returncode}\n")
-        f.write(f"timed_out: {timed_out}\n")
-        f.write(f"duration_seconds: {duration:.3f}\n")
-        f.write(f"process_traces: {len(trace_files)}\n")
-
-        for trace_path in trace_files:
-            f.write(f"trace_file: {trace_path.name}\n")
-
-        f.write("\n===== STDOUT =====\n")
-        f.write(stdout)
-
-        f.write("\n===== STDERR =====\n")
-        f.write(stderr)
-
-    if timed_out:
-        status = "timeout"
-    elif returncode == 0:
-        status = "passed"
-    else:
-        status = "failed"
-
-    return {
-        "test_name": name,
-        "helpers": helpers,
-        "status": status,
-        "returncode": returncode,
-        "duration_seconds": duration,
-        "trace_files": trace_files,
-        "rows": rows,
-    }
+        return {
+            "test_name": name, "helpers": helpers, "status": status,
+            "returncode": returncode, "duration_seconds": duration,
+            "trace_files": trace_files, "rows": rows, "resumed": False,
+        }
 
 
 def main():
@@ -356,7 +518,7 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip tests whose per-test CSV already exists",
+        help="Reuse only verified successful traces with matching execution metadata",
     )
 
     args = parser.parse_args()
@@ -473,130 +635,70 @@ def main():
     print(f"Output: {output_dir}")
     print()
 
+    stems = [trace_stem(test["name"]) for test in tests]
+    if len(set(stems)) != len(stems):
+        parser.error("test names must be unique; duplicate trace identities discovered")
+
     results = []
     suite_rows = []
 
     for index, test in enumerate(tests, start=1):
         name = test["name"]
-        stem = safe_name(name)
-
+        stem = trace_stem(name)
         trace_path = traces_dir / f"{stem}.csv"
+        metadata_path = traces_dir / f"{stem}.json"
         log_path = logs_dir / f"{stem}.log"
-
-        if args.resume and trace_path.exists():
-            rows = read_trace(trace_path)
-
-            unique_callsites = {
-                (row["caller_module"], row["caller_offset"])
-                for row in rows
-            }
-
-            result = {
-                "test_name": name,
-                "helpers": test["helpers"],
-                "status": "resumed",
-                "returncode": None,
-                "duration_seconds": 0.0,
-                "rows": rows,
-                "trace_events": len(rows),
-                "unique_callsites": len(unique_callsites),
-                "process_traces": 0,
-            }
-
-            results.append(result)
-
-            for row in rows:
-                suite_rows.append(
-                    {
-                        "test_name": name,
-                        **row,
-                    }
-                )
-
-            print(
-                f"[{index}/{len(tests)}] {name}: "
-                f"resumed ({len(rows)} events)"
-            )
-            continue
-
-        helper_text = ""
-
-        if test["helpers"]:
-            helper_text = (
-                f" [helpers: {' '.join(test['helpers'])}]"
-            )
-
-        print(
-            f"[{index}/{len(tests)}] "
-            f"{name}{helper_text}"
-        )
+        identity = None
+        print(f"[{index}/{len(tests)}] {name}")
 
         try:
-            test_cwd = cwd
             working_dir = runner.working_dir_for_test(test)
-
-            if working_dir:
-                test_cwd = resolve_path(working_dir)
-
-            app_command = runner.command_for_test(test)
-
-            result = run_test(
-                test=test,
-                app_command=app_command,
-                drrun=drrun,
-                client=client,
-                mode=args.mode,
-                cwd=test_cwd,
-                log_path=log_path,
-                timeout=args.timeout,
-            )
+            test_cwd = resolve_path(working_dir) if working_dir else cwd
+            app_command = [str(arg) for arg in runner.command_for_test(test)]
+            identity = trace_identity(test, args.runner, args.mode, app_command,
+                                      test_cwd, client, drrun, args.timeout)
+            result = load_resume(metadata_path, trace_path, identity) if args.resume else None
+            if result is None:
+                # Invalidate first, so interruption cannot leave an old success
+                # sidecar next to a new or partially written CSV.
+                metadata_path.unlink(missing_ok=True)
+                result = run_test(
+                    test=test, app_command=app_command, drrun=drrun, client=client,
+                    mode=args.mode, cwd=test_cwd, log_path=log_path, timeout=args.timeout,
+                )
+        except TraceIsolationError as exc:
+            metadata_path.unlink(missing_ok=True)
+            # A group that cannot be stopped makes subsequent collection unsafe.
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
         except Exception as exc:
-            test_cwd = cwd
+            metadata_path.unlink(missing_ok=True)
             result = {
-                "test_name": name,
-                "helpers": test["helpers"],
-                "status": "runner-error",
-                "returncode": None,
-                "duration_seconds": 0.0,
-                "trace_files": [],
-                "rows": [],
+                "test_name": name, "helpers": test["helpers"], "status": "runner-error",
+                "returncode": None, "duration_seconds": 0.0,
+                "trace_files": [], "rows": [], "resumed": False,
             }
-
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(f"\nRUNNER ERROR:\n{exc}\n")
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"\nRUNNER ERROR:\n{exc}\n")
 
         rows = result["rows"]
-
-        write_test_trace(trace_path, rows)
-
-        unique_callsites = {
-            (row["caller_module"], row["caller_offset"])
-            for row in rows
-        }
-
-        result["trace_events"] = len(rows)
-        result["unique_callsites"] = len(unique_callsites)
-        result["process_traces"] = len(result["trace_files"])
+        if not result.get("resumed", False):
+            write_test_trace(trace_path, rows)
+            result["trace_events"] = len(rows)
+            result["unique_callsites"] = len({
+                (row["caller_module"], row["caller_offset"]) for row in rows
+            })
+            result["process_traces"] = len(result["trace_files"])
+            save_metadata(metadata_path, trace_path, identity, result)
 
         results.append(result)
-
-        for row in rows:
-            suite_rows.append(
-                {
-                    "test_name": name,
-                    **row,
-                }
-            )
-
+        suite_rows.extend({"test_name": name, **row} for row in rows)
+        reused = " (reused verified trace)" if result.get("resumed", False) else ""
         print(
-            f"    {result['status']}, "
-            f"{result['duration_seconds']:.2f}s, "
-            f"{len(rows)} events, "
-            f"{len(unique_callsites)} unique callsites, "
-            f"{len(result['trace_files'])} process trace(s)"
+            f"    {result['status']}{reused}, {result['duration_seconds']:.2f}s, "
+            f"{len(rows)} events, {result['unique_callsites']} unique callsites, "
+            f"{result['process_traces']} process trace(s)"
         )
-
-        cleanup_pid_traces(test_cwd)
 
     suite_path = output_dir / "suite.csv"
     summary_path = output_dir / "summary.csv"
@@ -625,7 +727,7 @@ def main():
     )
 
     resumed = sum(
-        result["status"] == "resumed"
+        result.get("resumed", False)
         for result in results
     )
 
@@ -647,6 +749,9 @@ def main():
     print(f"Unique callsites   : {len(all_callsites)}")
     print(f"Suite trace        : {suite_path}")
     print(f"Summary            : {summary_path}")
+
+    if failed or timed_out or runner_errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

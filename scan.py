@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from elf_addresses import elf_image_base
+
 
 # Example objdump lines:
 #
@@ -70,6 +72,7 @@ def is_indirect_call(operand: str) -> bool:
 
 
 def scan_indirect_calls(binary: Path):
+    image_base = elf_image_base(binary)
     output = run_objdump(binary)
 
     callsites = []
@@ -87,7 +90,9 @@ def scan_indirect_calls(binary: Path):
         if not is_indirect_call(operand):
             continue
 
-        address = int(address_str, 16)
+        # objdump prints ELF virtual addresses; the tracer records offsets
+        # from the module mapping start, independent of PIE/load bias.
+        address = int(address_str, 16) - image_base
 
         callsites.append(
             {
@@ -130,11 +135,17 @@ def main():
         print(f"error: not a file: {binary}", file=sys.stderr)
         sys.exit(1)
 
-    callsites = scan_indirect_calls(binary)
+    try:
+        callsites = scan_indirect_calls(binary)
+        image_base = elf_image_base(binary)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     result = {
         "binary": str(binary),
         "module": binary.name,
+        "address_coordinate": "module-relative",
+        "elf_image_base": image_base,
         "indirect_callsites": callsites,
         "count": len(callsites),
     }

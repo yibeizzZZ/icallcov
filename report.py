@@ -4,20 +4,25 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+from elf_addresses import elf_image_base
 
-RUNTIME_MARKERS = (
-    "__libc_",
-    "__cxa_",
-    "_start",
-    "ld-linux",
-    "@glibc",
-    "@gcc",
-    "__gmon_start__",
-)
+
+RUNTIME_SYMBOLS = {"_start", "__gmon_start__"}
+RUNTIME_PREFIXES = ("__libc_", "__cxa_", "ld-linux")
+
+
+def is_runtime_symbol(symbol):
+    # Match names, not arbitrary instruction substrings: worker_start is
+    # not _start. objdump annotations can append +0xNN and symbol versions.
+    symbol = re.split(r"[+-]0x[0-9a-f]+$", symbol.lower())[0]
+    name, _, version = symbol.partition("@")
+    return (name in RUNTIME_SYMBOLS or name.startswith(RUNTIME_PREFIXES)
+            or version.lstrip("@").startswith(("glibc_", "gcc_")))
 
 
 def normalize_module(name: str) -> str:
@@ -33,6 +38,16 @@ def normalize_offset(value) -> int:
 def load_static(path: Path):
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # Old scans used ELF VAs even though their field was called "offset".
+    # Reject them rather than silently reporting incorrect non-PIE coverage.
+    image_base = data.get("elf_image_base")
+    if (data.get("address_coordinate") != "module-relative"
+            or type(image_base) is not int or image_base < 0 or image_base % 4096):
+        raise ValueError(
+            "static JSON has missing or unsupported address metadata; "
+            "regenerate it with scan.py"
+        )
 
     sites = {}
 
@@ -138,6 +153,9 @@ def load_dynamic(path: Path):
 
 
 def symbolize(binary: Path, offset: int):
+    # addr2line consumes ELF VAs, whereas all coverage/edge keys are module
+    # offsets. This conversion applies equally to callers and targets.
+    address = elf_image_base(binary) + offset
     try:
         result = subprocess.run(
             [
@@ -146,7 +164,7 @@ def symbolize(binary: Path, offset: int):
                 "-C",
                 "-e",
                 str(binary),
-                hex(offset),
+                hex(address),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -204,13 +222,6 @@ def classify_site(function, location, instruction,
                   libuv_compat=False):
     fn = (function or "").lower()
     loc = (location or "").lower()
-    ins = (instruction or "").lower()
-
-    if any(marker in fn for marker in RUNTIME_MARKERS):
-        return "runtime"
-
-    if any(marker in ins for marker in RUNTIME_MARKERS):
-        return "runtime"
 
     location_path = normalize_location_path(location)
 
@@ -237,6 +248,12 @@ def classify_site(function, location, instruction,
             )
             if is_under(candidate, full_source_dir):
                 return "project"
+
+    # Explicit source/test directories are authoritative. Runtime name
+    # heuristics are only a fallback for sites outside those directories.
+    symbols = [fn, *re.findall(r"<([^<>]+)>", instruction or "")]
+    if any(is_runtime_symbol(symbol) for symbol in symbols):
+        return "runtime"
 
     basename = os.path.basename(location_path or "").lower()
 
@@ -517,8 +534,11 @@ def main():
         print(f"error: dynamic file not found: {dynamic_path}", file=sys.stderr)
         sys.exit(1)
 
-    static_data, static_sites = load_static(static_path)
-    dynamic_sites, dynamic_edges, skipped_rows = load_dynamic(dynamic_path)
+    try:
+        static_data, static_sites = load_static(static_path)
+        dynamic_sites, dynamic_edges, skipped_rows = load_dynamic(dynamic_path)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     binary = None
 
@@ -528,6 +548,14 @@ def main():
         candidate = Path(static_data["binary"])
         if candidate.exists():
             binary = candidate.resolve()
+
+    if binary is not None:
+        try:
+            if elf_image_base(binary) != static_data["elf_image_base"]:
+                raise ValueError("binary ELF image base differs from static JSON; "
+                                 "regenerate it with scan.py for this binary")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
 
     project_root = Path(args.project_root).resolve() if args.project_root else None
     source_dirs = args.source_dir or ["src"]

@@ -41,6 +41,10 @@ trace_print_module_offset(file_t file, app_pc pc)
     module_data_t *mod = dr_lookup_module(pc);
     if (mod != NULL) {
         const char *name = dr_module_preferred_name(mod);
+        /* Canonical coordinate: offset from the module mapping start.
+         * scan.py subtracts the page-aligned lowest ELF PT_LOAD virtual
+         * address, giving the same offset for PIE and non-PIE binaries.
+         * report.py adds that ELF base back only for symbolization. */
         size_t offset = (size_t)(pc - mod->start);
         dr_fprintf(file, "%s,0x%zx", name != NULL ? name : "<unknown>", offset);
         dr_free_module_data(mod);
