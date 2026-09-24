@@ -24,7 +24,7 @@ Native programs use indirect calls for callbacks, function pointers, and other f
 
 ## How It Works
 
-1. `scan.py` invokes `objdump` to statically scan an ELF binary and discover x86-64 indirect callsites.
+1. `scan.py` invokes `objdump` to statically scan an ELF binary and discover x86-64 indirect callsites, including prefixed forms such as `notrack call` and `bnd call`. Offsets refer to the start of the full instruction, including its prefixes.
 2. `run_suite.py` discovers tests via a runner adapter, runs each one under the DynamoRIO client (`-mode fast` or `-mode edge`), and aggregates the resulting per-process traces.
 3. `report.py` compares static callsites against dynamically executed callsites using module names and offsets.
 4. The report classifies callsites as project, test, runtime, or unknown.
@@ -37,7 +37,7 @@ Native programs use indirect calls for callbacks, function pointers, and other f
 6. When debug information is available, `addr2line` maps ELF virtual addresses back to source functions, files, and lines to support classification and inspection.
 7. In `edge` mode, `report.py --show-targets`/`--export-edges` reports the runtime targets *observed* at each covered callsite, symbolized the same way.
 
-**Classification is generic by default**: explicit `--project-root`/`--source-dir`/`--test-dir` matches take precedence over runtime-name heuristics. Outside those directories, it checks runtime symbols and a small path-based fallback (`test-*` filenames, `/test/`/`/tests/` directories). `_start` is an exact symbol match; a project function named `worker_start` is not excluded just because its name contains `_start`. It does **not** classify arbitrary `uv_*`/`uv__*`-style names as project code unless you explicitly opt in with `--libuv-compat`. Review filtered callsites when interpreting results. If no project callsites are identified, the current report prints `0.0%`.
+**Classification is generic by default**: explicit `--project-root`/`--source-dir`/`--test-dir` matches take precedence over runtime-name heuristics. Outside those directories, it checks runtime symbols and a small path-based fallback (`test-*` filenames, `/test/`/`/tests/` directories). `_start` is an exact symbol match; a project function named `worker_start` is not excluded just because its name contains `_start`. It does **not** classify arbitrary `uv_*`/`uv__*`-style names as project code unless you explicitly opt in with `--libuv-compat`. Review filtered callsites when interpreting results. If no project callsites are identified, the report prints `N/A`, exports `coverage: null` and `coverage_status: "indeterminate"`, and exits with status 2 after writing diagnostic outputs. Check debug information and source/test classification paths; a binary with no project indirect calls also has an undefined denominator. A valid nonzero denominator with no executed sites still reports `0.0%`.
 
 ### Address coordinates
 
@@ -52,7 +52,7 @@ The DynamoRIO client (`dynamorio/icall_trace.c`) supports two modes, selected wi
 - **`fast`** — callsite-only tracing. Each row records that a callsite executed, with `target_module`/`target_offset` recorded as the placeholder `<not-recorded>`. Lowest overhead; sufficient for callsite coverage but not target-set analysis.
 - **`edge`** — callsite + observed target tracing. Each row also records the actual runtime target module/offset, enabling `report.py --show-targets`/`--export-edges`.
 
-Both modes produce the same trace CSV shape (`caller_module,caller_offset,target_module,target_offset`), so `report.py` handles either transparently.
+Both modes produce the same trace CSV shape (`caller_module,caller_offset,target_module,target_offset`), so `report.py` handles either transparently. Module names containing CSV delimiters or quotes are escaped, including executable names containing commas.
 
 ## Multi-Process Tracing and Suite Aggregation
 
@@ -64,13 +64,21 @@ Each traced process writes `dynamic.<pid>.csv` in its working directory. Separat
 - appends every per-test row (tagged with `test_name`) into a suite-wide `<output-dir>/suite.csv`,
 - writes one summary row per test (status, duration, trace/callsite counts, process-trace count, and a `resumed` flag) to `<output-dir>/summary.csv`,
 - writes per-test JSON metadata alongside each trace, and supports `--resume` only for matching, previously passed results with an intact trace,
-- exits with a nonzero status if any test fails or times out.
+- exits with a nonzero status if any test fails or times out,
+- exits nonzero when filtering selects no tests, removing previous `suite.csv` and `summary.csv` aggregates while preserving per-test traces, metadata, and logs for later reuse.
 
 The per-test filename stem combines a readable, sanitized test-name prefix with the first 20 hexadecimal characters of the test name's SHA-256 digest. Names such as `A/B` and `A:B` therefore have distinct artifacts even if their readable prefixes match.
 
 Resume validates the trace hash and saved execution identity: runner, tracing mode, test, command arguments, executable path/content, working directory, client and `drrun` paths/content, environment digest, and timeout. A resumed result keeps its original `passed` status and sets `resumed` to true. Failed or timed-out tests, changed inputs, missing metadata, and damaged traces rerun. Older filename-only caches are not sufficient for resume. This does not fingerprint arbitrary input files, shared libraries, or other external state used by a test; rerun without `--resume` when those change.
 
 `suite.csv` is what you normally pass to `report.py`; it is a superset of a single-test `dynamic.csv` with an added `test_name` column, and `report.py` uses that column (when present) to record which tests observed each edge in `--export-edges` output.
+
+If a process trace is malformed or truncated, the suite excludes that entire
+process trace and retains valid traces from other processes. The test log keeps
+stdout/stderr, elapsed time, and the execution result, followed by `TRACE ERROR`
+diagnostics. A timeout or failed execution keeps its original status; a process
+that exits successfully but produces a damaged trace is marked `runner-error`.
+Coverage from such a run is partial, and the suite exits nonzero.
 
 ## Runner Support
 

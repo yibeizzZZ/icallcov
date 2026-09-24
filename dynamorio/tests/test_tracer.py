@@ -9,6 +9,7 @@ import argparse
 import csv
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -104,6 +105,30 @@ class TracerTests(unittest.TestCase):
                     if row["target_module"] == self.binary.name
                     and int(row["target_offset"], 16) == self.symbols[target]]
             self.assertEqual(len(hits), 400, target)
+
+    def test_module_names_with_csv_metacharacters_round_trip(self):
+        original = self.binary
+        self.binary = self.root / 'trace,fixture"quoted'
+        shutil.copy2(original, self.binary)
+        for mode in ("fast", "edge"):
+            with self.subTest(mode=mode):
+                _, traces = self.run_trace(("-mode", mode))
+                self.assertEqual(len(traces), 1)
+                rows = next(iter(traces.values()))
+                edges = self.fixture_rows(rows, "dispatch")
+                self.assertTrue(edges)
+                if mode == "edge":
+                    self.assertEqual(len(edges), 800)
+                    self.assertTrue(all(row["target_module"] == self.binary.name
+                                        for row in edges))
+                    self.assertEqual(
+                        {int(row["target_offset"], 16) for row in edges},
+                        {self.symbols["target_a"], self.symbols["target_b"]},
+                    )
+                else:
+                    self.assertTrue(all(row["target_module"] == "<not-recorded>"
+                                        and row["target_offset"] == "0x0"
+                                        for row in edges))
 
     def test_fork_has_separate_pid_files_and_child_only_coverage(self):
         for mode in ("fast", "edge"):

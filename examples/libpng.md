@@ -131,7 +131,12 @@ and summary rows. Within each report identity remains `(module, offset)`.
 
 Scan/report errors mark the target `error`; test failures mark it `failed` and
 may still yield partial coverage. Remaining targets are attempted, and the
-command exits nonzero if any target fails. Inspect suite summaries and logs,
+command exits nonzero if any target fails. If no project callsites are identified,
+coverage is `null` in JSON (blank in CSV, `N/A` in text), with
+`coverage_status: "indeterminate"`. A target whose tests passed is then marked
+`indeterminate`, not `passed`, and the project command exits nonzero. Test failures
+retain `failed` even when coverage is also indeterminate. Diagnostic reports and
+edge exports are still written. Inspect suite summaries and logs,
 not just coverage percentages. Reruns execute all tests; project-level resume
 and target selection are not implemented. Use a new output directory for a new
 manifest/mode to avoid confusing old artifacts from targets no longer selected.

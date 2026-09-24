@@ -35,14 +35,23 @@ VALUE_OPTIONS = {
     '--gcc-toolchain', '-Xclang', '-Xpreprocessor', '-Xassembler', '-Xlinker',
     '-mllvm', '-stdlib', '-std', '-isystem-after', '-iframework', '-F',
 }
-DROP_VALUES = {'-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-serialize-diagnostics'}
+DROP_VALUES = {'-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-serialize-diagnostics',
+               '-foptimization-record-file', '-foptimization-record-passes'}
 DROP_FLAGS = {'-c', '-S', '-E', '-emit-llvm', '-fsyntax-only', '-M', '-MM',
               '-MD', '-MMD', '-MP', '-MG', '-flto', '-fno-lto', '-save-temps',
-              '--save-temps', '-ftime-trace'}
+              '--save-temps', '-ftime-trace', '-fsave-optimization-record'}
 UNSUPPORTED = {'-cc1', '--analyze', '-emit-ast', '-emit-pch', '-include-pch',
                '-include-pth', '--coverage', '-fprofile-arcs', '-ftest-coverage',
                '-working-directory'}
 CPP_SUFFIXES = {'.C', '.cc', '.cp', '.cpp', '.cxx', '.c++', '.ii', '.CPP', '.CC'}
+OPT_RECORD_PREFIXES = ('-fsave-optimization-record=', '-foptimization-record-')
+
+
+def unsafe_forwarded_option(value):
+    return (value in DROP_VALUES | DROP_FLAGS | UNSUPPORTED
+            or value.startswith(('-dependency-file', '-emit-', '-o=',
+                                 '-opt-record-', '-pass-remarks-output',
+                                 *OPT_RECORD_PREFIXES)))
 
 
 def split_arguments(text, description):
@@ -126,8 +135,7 @@ def command_parts(unit):
             elif arg == '-x':
                 language = None if value == 'none' else value
             elif arg in VALUE_OPTIONS:
-                if arg.startswith('-X') and (value in DROP_VALUES | DROP_FLAGS | UNSUPPORTED
-                                               or value.startswith(('-dependency-file', '-emit-', '-o='))):
+                if (arg.startswith('-X') or arg == '-mllvm') and unsafe_forwarded_option(value):
                     raise ScanError(f'entry {unit.index}: unsupported forwarded option {arg} {value}')
                 kept.extend((arg, value))
             continue
@@ -135,13 +143,18 @@ def command_parts(unit):
             language = None if arg[2:] == 'none' else arg[2:]
             continue
         if not positional:
+            option, separator, value = arg.partition('=')
+            if (separator and (option.startswith('-X') or option == '-mllvm')
+                    and unsafe_forwarded_option(value)):
+                raise ScanError(f'entry {unit.index}: unsupported forwarded option {arg}')
             original_output = joined_output(arg)
             if original_output is not None:
                 output = original_output
                 continue
             if arg in DROP_FLAGS or arg.startswith(('-MF', '-MT', '-MQ', '-MJ',
                                                      '-flto=', '-save-temps=', '--save-temps=',
-                                                     '-ftime-trace=', '-serialize-diagnostics=')):
+                                                     '-ftime-trace=', '-serialize-diagnostics=',
+                                                     *OPT_RECORD_PREFIXES)):
                 continue
             if arg in UNSUPPORTED or arg.startswith(('--driver-mode=', '--config',
                                                      '-fmodule', '-fplugin', '-working-directory=')):
@@ -266,6 +279,45 @@ def run_tool(command, cwd, description):
         print(result.stderr, file=sys.stderr, end='')
 
 
+def publish_reports(run_dir, output_dir):
+    """Replace the report pair, restoring earlier files on publication failure.
+
+    This is rollback for ordinary filesystem errors, not crash/concurrency
+    atomicity. The caller retains run_dir on publication errors so backups and
+    any IR referenced by a partially published JSON remain recoverable.
+    """
+    names = ('callsites.json', 'callsites.txt')
+    backups = {}
+    for name in names:
+        destination = output_dir / name
+        if destination.exists() and not destination.is_file():
+            raise ScanError(f'report destination is not a file: {destination}')
+        if destination.exists() or destination.is_symlink():
+            backup = run_dir / ('previous-' + name)
+            shutil.copy2(destination, backup, follow_symlinks=False)
+            backups[name] = backup
+    published = []
+    try:
+        for name in names:
+            (run_dir / name).replace(output_dir / name)
+            published.append(name)
+    except OSError as error:
+        recovery_errors = []
+        for name in reversed(published):
+            try:
+                if name in backups:
+                    backups[name].replace(output_dir / name)
+                else:
+                    (output_dir / name).unlink(missing_ok=True)
+            except OSError as recovery_error:
+                recovery_errors.append(str(recovery_error))
+        detail = ('; rollback errors: ' + '; '.join(recovery_errors)) if recovery_errors else ''
+        raise ScanError(f'report publication failed: {error}{detail}; '
+                        f'IR and recovery files retained in {run_dir}') from error
+    for backup in backups.values():
+        backup.unlink()
+
+
 def scan_project(compdb, output_dir, output_match=None, clang='clang-21',
                  clangxx='clang++-21', scanner=None):
     units = load_compdb(compdb, output_match)
@@ -278,7 +330,7 @@ def scan_project(compdb, output_dir, output_match=None, clang='clang-21',
     ir_root = output_dir / 'ir'
     ir_root.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix='run-', dir=ir_root))
-    succeeded = False
+    keep_run_dir = False
     try:
         bitcode = []
         digests = set()
@@ -311,15 +363,14 @@ def scan_project(compdb, output_dir, output_match=None, clang='clang-21',
             raise ScanError(f'invalid scanner output: {error}') from error
         text_path = run_dir / 'callsites.txt'
         text_path.write_text(readable)
-        # Compilation and scanning failures leave both previous reports intact.
-        # Keep IR at its scanned path so JSON module input_file remains valid.
-        json_path.replace(output_dir / 'callsites.json')
-        text_path.replace(output_dir / 'callsites.txt')
-        succeeded = True
+        # Once publication starts, keep IR even if rollback also encounters an
+        # error: an installed JSON must never point at files we deleted.
+        keep_run_dir = True
+        publish_reports(run_dir, output_dir)
         print(f'{len(units)} compilation units, {len(bitcode)} distinct IR modules, '
               f'{document["count"]} indirect callsites -> {output_dir}', file=sys.stderr)
     finally:
-        if not succeeded:
+        if not keep_run_dir:
             shutil.rmtree(run_dir)
 
 

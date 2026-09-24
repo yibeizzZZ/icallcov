@@ -186,14 +186,18 @@ def read_trace(trace_path: Path):
     return rows
 
 
-def collect_pid_traces(cwd: Path):
-    trace_files = sorted(cwd.glob("dynamic.*.csv"))
-    rows = []
+def collect_pid_traces(trace_files):
+    rows, errors = [], []
 
     for trace_path in trace_files:
-        rows.extend(read_trace(trace_path))
+        try:
+            rows.extend(read_trace(trace_path))
+        except (OSError, ValueError, csv.Error) as exc:
+            # Reject the entire damaged process trace, but retain other
+            # processes' valid traces and the original execution result.
+            errors.append(f"{trace_path.name}: {exc}")
 
-    return trace_files, rows
+    return rows, errors
 
 
 def cleanup_pid_traces(trace_files):
@@ -382,8 +386,9 @@ def run_test(
             err.seek(0)
             stdout, stderr = out.read(), err.read()
 
-        # Collection is allowed only after the entire test group has stopped.
-        trace_files, rows = collect_pid_traces(cwd)
+        # Save execution evidence before parsing any potentially truncated trace.
+        # Enumeration/collection happens only after the entire group has stopped.
+        trace_files = sorted(cwd.glob("dynamic.*.csv"))
         duration = time.monotonic() - started
         returncode = None if timed_out else proc.returncode
         status = "timeout" if timed_out else ("passed" if returncode == 0 else "failed")
@@ -400,6 +405,18 @@ def run_test(
             for path in trace_files:
                 stream.write(f"trace_file: {path.name}\n")
             stream.write(f"\n===== STDOUT =====\n{stdout}\n===== STDERR =====\n{stderr}")
+
+        rows, trace_errors = collect_pid_traces(trace_files)
+        if trace_errors:
+            with log_path.open("a", encoding="utf-8") as stream:
+                stream.write("\n===== TRACE ERRORS =====\n")
+                for error in trace_errors:
+                    stream.write(f"TRACE ERROR: {error}\n")
+                stream.write("Coverage is partial: damaged process traces were excluded.\n")
+            # A failed/timeout execution keeps its primary status. A successful
+            # process with invalid tracing is not a successful coverage run.
+            if status == "passed":
+                status = "runner-error"
 
         return {
             "test_name": name, "helpers": helpers, "status": status,
@@ -622,8 +639,13 @@ def main():
         tests = tests[: args.limit]
 
     if not tests:
-        print("No tests selected.")
-        return
+        # A successful earlier run must not masquerade as this empty selection.
+        # Keep per-test traces/metadata available for a subsequent --resume.
+        for filename in ("suite.csv", "summary.csv"):
+            (output_dir / filename).unlink(missing_ok=True)
+        print("error: No tests selected; previous suite aggregates removed.",
+              file=sys.stderr)
+        sys.exit(1)
 
     print(f"Discovered/selected tests: {len(tests)}")
     print(f"Runner: {args.runner}")

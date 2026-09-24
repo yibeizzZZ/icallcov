@@ -312,6 +312,15 @@ def build_site_records(
     return records
 
 
+def symbolize_target(binary, module, offset, cache):
+    if cache is None or binary is None or binary.name != module:
+        return None, None
+    key = (module, offset)
+    if key not in cache:
+        cache[key] = symbolize(binary, offset)
+    return cache[key]
+
+
 def build_edge_export(
     project_sites,
     project_covered,
@@ -334,20 +343,9 @@ def build_edge_export(
 
         targets = []
 
-        for (target_module, target_offset), info in sorted(
-            targets_map.items(),
-            key=lambda item: (item[0][0], item[0][1]),
-        ):
-            target_function = None
-            target_location = None
-
-            if binary is not None and binary.name == target_module:
-                cache_key = (target_module, target_offset)
-
-                if cache_key not in target_cache:
-                    target_cache[cache_key] = symbolize(binary, target_offset)
-
-                target_function, target_location = target_cache[cache_key]
+        for (target_module, target_offset), info in sorted(targets_map.items()):
+            target_function, target_location = symbolize_target(
+                binary, target_module, target_offset, target_cache)
 
             targets.append(
                 {
@@ -429,22 +427,8 @@ def print_site(
                     f"({count} hits)"
                 )
 
-                target_function = None
-                target_location = None
-
-                if (
-                    target_cache is not None
-                    and binary is not None
-                    and binary.name == target_module
-                ):
-                    cache_key = (target_module, target_offset)
-
-                    if cache_key not in target_cache:
-                        target_cache[cache_key] = symbolize(
-                            binary, target_offset
-                        )
-
-                    target_function, target_location = target_cache[cache_key]
+                target_function, target_location = symbolize_target(
+                    binary, target_module, target_offset, target_cache)
 
                 print(target_line)
 
@@ -461,7 +445,8 @@ def coverage_summary(static_sites, project_sites, dynamic_sites):
     total = len(project_sites)
     return {"raw_static": len(static_sites), "static": total,
             "covered": covered, "uncovered": total - covered,
-            "coverage": covered / total * 100.0 if total else 0.0}
+            "coverage": covered / total * 100.0 if total else None,
+            "coverage_status": "valid" if total else "indeterminate"}
 
 
 def main():
@@ -593,29 +578,20 @@ def main():
     project_sites = categories["project"]
     project_covered = project_sites & dynamic_sites
     project_uncovered = project_sites - dynamic_sites
+    summary = coverage_summary(static_sites, project_sites, dynamic_sites)
 
     if args.export_summary:
         summary_path = Path(args.export_summary)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(json.dumps(coverage_summary(
-            static_sites, project_sites, dynamic_sites), indent=2) + "\n",
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n",
             encoding="utf-8")
 
-    raw_total = len(static_sites)
-    project_total = len(project_sites)
-    project_covered_count = len(project_covered)
-    project_uncovered_count = len(project_uncovered)
-
-    coverage = (
-        project_covered_count / project_total * 100.0
-        if project_total
-        else 0.0
-    )
+    coverage = summary["coverage"]
 
     print()
     print("Indirect Call Coverage")
     print("=" * 48)
-    print(f"Raw indirect callsites : {raw_total}")
+    print(f"Raw indirect callsites : {summary['raw_static']}")
     print()
     print("Classification")
     print("-" * 48)
@@ -626,10 +602,16 @@ def main():
     print()
     print("Project Coverage")
     print("-" * 48)
-    print(f"Total project sites   : {project_total}")
-    print(f"Covered               : {project_covered_count}")
-    print(f"Uncovered             : {project_uncovered_count}")
-    print(f"Coverage              : {coverage:.1f}%")
+    print(f"Total project sites   : {summary['static']}")
+    print(f"Covered               : {summary['covered']}")
+    print(f"Uncovered             : {summary['uncovered']}")
+    if coverage is None:
+        print("Coverage              : N/A (indeterminate: no project callsites)")
+        print("Check debug information, --project-root, --source-dir and --test-dir; "
+              "inspect unknown sites with --show-filtered. "
+              "The binary may also contain no project indirect calls.")
+    else:
+        print(f"Coverage              : {coverage:.1f}%")
 
     if skipped_rows:
         print(f"Skipped malformed rows: {skipped_rows}")
@@ -696,6 +678,9 @@ def main():
 
         print(f"Observed edge set written to: {export_path}")
 
+    # Finish diagnostic exports before signaling an undefined denominator.
+    return 2 if coverage is None else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

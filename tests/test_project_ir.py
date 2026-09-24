@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scan_project_ir.py'
@@ -256,6 +257,75 @@ class ProjectIRTests(unittest.TestCase):
             for name in ('callsites.json', 'callsites.txt'):
                 self.assertEqual((output / name).read_text(), 'previous result')
             self.assertFalse(list((output / 'ir').rglob('*.bc')))
+
+    def test_optimization_record_outputs_do_not_overwrite_build_files(self):
+        flags = ['-fsave-optimization-record', '-fsave-optimization-record=yaml',
+                 '-foptimization-record-file=remarks.yaml',
+                 '-foptimization-record-passes=.*']
+        unit = self.load([self.entry(flags)])[0]
+        command = self.mod.bitcode_command(unit, self.root / 'out.bc', 'clang', 'clang++')
+        self.assertFalse(any('optimization-record' in arg for arg in command))
+        for forwarded in (['-Xclang', '-opt-record-file', '-Xclang', 'remarks.yaml'],
+                          ['-mllvm', '-pass-remarks-output=remarks.yaml'],
+                          ['-Xclang=-opt-record-file', '-Xclang=remarks.yaml'],
+                          ['-mllvm=-pass-remarks-output=remarks.yaml'],
+                          ['-Xclang', '-mllvm', '-Xclang', '-pass-remarks-output=remarks.yaml']):
+            with self.subTest(forwarded=forwarded):
+                with self.assertRaises(self.mod.ScanError):
+                    self.load([self.entry(forwarded)])
+        self.require_native()
+        report = self.build / 'remarks.yaml'
+        report.write_text('original optimization report')
+        result = self.run_workflow([self.entry(flags)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report.read_text(), 'original optimization report')
+
+    def test_publication_failure_restores_previous_reports(self):
+        self.require_native()
+        result = self.run_workflow([self.entry()])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.root / 'result'
+        previous = {name: (output / name).read_bytes()
+                    for name in ('callsites.json', 'callsites.txt')}
+        original_replace = Path.replace
+        for filename in previous:
+            injected = []
+
+            def fail_once(path, destination):
+                if path.name == filename and Path(destination) == output / filename and not injected:
+                    injected.append(True)
+                    raise OSError('injected publication failure')
+                return original_replace(path, destination)
+
+            with self.subTest(filename=filename), patch.object(Path, 'replace', fail_once):
+                with self.assertRaises((OSError, self.mod.ScanError)):
+                    self.mod.scan_project(self.db, output)
+            self.assertTrue(injected)
+            for name, content in previous.items():
+                self.assertEqual((output / name).read_bytes(), content)
+            for module in json.loads((output / 'callsites.json').read_text())['modules']:
+                self.assertTrue(Path(module['input_file']).is_file())
+        (output / 'callsites.txt').unlink()
+        (output / 'callsites.txt').mkdir()
+        result = self.run_workflow([self.entry()])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((output / 'callsites.json').read_bytes(), previous['callsites.json'])
+        self.assertTrue((output / 'callsites.txt').is_dir())
+        (output / 'callsites.txt').rmdir()
+        (output / 'callsites.txt').write_bytes(previous['callsites.txt'])
+
+        def fail_publication_and_rollback(path, destination):
+            if path.name in ('callsites.txt', 'previous-callsites.json'):
+                raise OSError('injected rollback failure')
+            return original_replace(path, destination)
+
+        with patch.object(Path, 'replace', fail_publication_and_rollback):
+            with self.assertRaisesRegex(self.mod.ScanError, 'rollback errors'):
+                self.mod.scan_project(self.db, output)
+        document = json.loads((output / 'callsites.json').read_text())
+        for module in document['modules']:
+            self.assertTrue(Path(module['input_file']).is_file())
+        self.assertTrue(list((output / 'ir').rglob('previous-callsites.json')))
 
 
 if __name__ == '__main__':

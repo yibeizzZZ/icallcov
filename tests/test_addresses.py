@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import report
 import scan
@@ -109,6 +110,41 @@ int main(void) { dispatch(sink); worker_start(sink); return 0; }
                 function, location = report.symbolize(binary, address - base)
                 self.assertEqual(function, "dispatch")
                 self.assertIn("/src/probe.c:", location)
+
+    def test_prefixed_indirect_calls_are_scanned_at_instruction_start(self):
+        source = self.directory / 'prefixed.S'
+        source.write_text('''
+.text
+.globl main
+main:
+    lea sink(%rip), %rax
+    notrack call *%rax
+    xor %eax, %eax
+    ret
+sink:
+    ret
+.section .note.GNU-stack,"",@progbits
+''')
+        binary = self.directory / 'prefixed'
+        subprocess.run(['cc', '-g', str(source), '-o', str(binary)],
+                       check=True, capture_output=True)
+        disassembly = scan.run_objdump(binary)
+        address = int(re.search(r'^\s*([0-9a-f]+):\s+notrack call\s+\*',
+                                disassembly, re.M)[1], 16)
+        sites = scan.scan_indirect_calls(binary)
+        self.assertIn(address - scan.elf_image_base(binary), {s['offset'] for s in sites})
+        text = '''
+  401010: notrack call *%rax
+  401020: bnd notrack callq *0x20(%rbx)
+  401030: addr32 call 401080 <direct>
+  401040: notrack jmp *%rax
+  401050: rex.W call *%rax
+'''
+        with patch.object(scan, 'run_objdump', return_value=text), \
+                patch.object(scan, 'elf_image_base', return_value=0x400000):
+            sites = scan.scan_indirect_calls(binary)
+        self.assertEqual([s['offset'] for s in sites], [0x1010, 0x1020, 0x1050])
+        self.assertEqual(sites[1]['instruction'], 'bnd notrack callq *0x20(%rbx)')
 
     def test_native_coverage_and_edge_symbolization_match_for_all_elf_layouts(self):
         drrun = Path(os.environ.get("DRRUN", str(Path.home() / "tools/dynamorio/build/bin64/drrun")))

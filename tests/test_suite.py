@@ -89,6 +89,24 @@ sys.exit(1 if kind == 'fail' else 0)
     def calls(self):
         return (self.cwd / 'calls.txt').read_text().splitlines()
 
+    def test_empty_selection_invalidates_aggregates_without_running_tests(self):
+        for selection in (('--match', '^absent$'), ('--exclude', '.*'), ('--limit', '0')):
+            with self.subTest(selection=selection):
+                self.suite([('first', 'ok')])
+                before = self.calls()
+                proc = subprocess.run([
+                    sys.executable, str(ROOT / 'run_suite.py'), '--runner', 'commands',
+                    '--tests-file', str(self.commands), '--drrun', str(self.drrun),
+                    '--client', str(self.client), '--cwd', str(self.cwd),
+                    '--output-dir', str(self.output), *selection],
+                    capture_output=True, text=True, timeout=15)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn('No tests selected', proc.stderr)
+                self.assertFalse((self.output / 'suite.csv').exists())
+                self.assertFalse((self.output / 'summary.csv').exists())
+                self.assertTrue(list((self.output / 'traces').glob('*.csv')))
+                self.assertEqual(before, self.calls())
+
     def test_names_that_sanitize_identically_execute_and_save_separately(self):
         proc, rows = self.suite([('foo/bar', 'first'), ('foo_bar', 'second')], '--resume')
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -130,6 +148,38 @@ sys.exit(1 if kind == 'fail' else 0)
         self.assertEqual(rows[0]['status'], 'timeout')
         self.assertEqual(rows[0]['resumed'], 'False')
         self.assertFalse((self.cwd / 'contaminated').exists())
+
+    def test_corrupt_trace_preserves_execution_result_and_logs(self):
+        self.program.write_text(f'#!{sys.executable}\n' + '''import os, sys, time
+from pathlib import Path
+header = 'caller_module,caller_offset,target_module,target_offset\\n'
+Path(f'dynamic.{os.getpid()}.csv').write_text(
+    header + 'app,0x08,target,0x18\\n' + 'app,0x10,target,')
+Path('dynamic.999998.csv').write_text(header + 'good,0x20,target,0x30\\n')
+print('stdout diagnostic', flush=True)
+print('stderr diagnostic', file=sys.stderr, flush=True)
+if sys.argv[1] == 'timeout':
+    time.sleep(10)
+sys.exit(7 if sys.argv[1] == 'fail' else 0)
+''')
+        for kind, status, code in (('timeout', 'timeout', ''),
+                                   ('fail', 'failed', '7'),
+                                   ('ok', 'runner-error', '0')):
+            with self.subTest(kind=kind):
+                proc, rows = self.suite([(kind, kind)], '--timeout', '0.3')
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(rows[0]['status'], status)
+                self.assertEqual(rows[0]['returncode'], code)
+                self.assertGreater(float(rows[0]['duration_seconds']), 0)
+                self.assertEqual(rows[0]['process_traces'], '2')
+                self.assertEqual(rows[0]['trace_events'], '1')
+                log = next((self.output / 'logs').glob(f'{kind}-*.log')).read_text()
+                self.assertIn('stdout diagnostic', log)
+                self.assertIn('stderr diagnostic', log)
+                self.assertIn('TRACE ERROR', log)
+                self.assertIn('incomplete CSV row', log)
+                if kind == 'timeout':
+                    self.assertIn('timed_out: True', log)
         self.assertNotEqual(proc.returncode, 0)
 
     def test_resume_rejects_different_runner_or_test_identity(self):
@@ -141,15 +191,6 @@ sys.exit(1 if kind == 'fail' else 0)
             metadata['identity'][field] = other
             metadata_path.write_text(json.dumps(metadata))
             self.suite([('one', 'ok')], '--resume')
-        self.assertEqual(self.calls(), ['ok', 'ok', 'ok'])
-
-    def test_corrupt_metadata_is_not_trusted(self):
-        self.suite([('one', 'ok')])
-        metadata_path = next((self.output / 'traces').glob('*.json'))
-        metadata_path.write_text('{interrupted')
-        self.suite([('one', 'ok')], '--resume')
-        metadata_path.write_text('[]')
-        self.suite([('one', 'ok')], '--resume')
         self.assertEqual(self.calls(), ['ok', 'ok', 'ok'])
 
     def test_partial_or_invalid_result_metadata_forces_rerun(self):
@@ -171,17 +212,22 @@ sys.exit(1 if kind == 'fail' else 0)
                 self.assertEqual(rows[0]['resumed'], 'False')
         self.assertEqual(len(self.calls()), 1 + len(changes))
 
-    def test_missing_metadata_or_corrupt_csv_forces_rerun(self):
+    def test_missing_or_corrupt_cache_forces_rerun(self):
         self.suite([('one', 'ok')])
-        metadata = list((self.output / 'traces').glob('*.json'))
-        self.assertEqual(len(metadata), 1)
-        metadata[0].unlink()
-        self.suite([('one', 'ok')], '--resume')
-        self.assertEqual(self.calls(), ['ok', 'ok'])
+        metadata = next((self.output / 'traces').glob('*.json'))
         trace = next((self.output / 'traces').glob('*.csv'))
-        trace.write_text(HEADER)
-        self.suite([('one', 'ok')], '--resume')
-        self.assertEqual(self.calls(), ['ok', 'ok', 'ok'])
+        for damage in ('missing', '{interrupted', '[]', 'trace'):
+            with self.subTest(damage=damage):
+                if damage == 'missing':
+                    metadata.unlink()
+                elif damage == 'trace':
+                    trace.write_text(HEADER)
+                else:
+                    metadata.write_text(damage)
+                proc, rows = self.suite([('one', 'ok')], '--resume')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(rows[0]['resumed'], 'False')
+        self.assertEqual(len(self.calls()), 5)
 
     def test_timeout_kills_children_before_collecting_next_test(self):
         kwargs = dict(drrun=self.drrun, client=self.client, mode='fast', cwd=self.cwd)
@@ -198,15 +244,6 @@ sys.exit(1 if kind == 'fail' else 0)
         self.assertFalse((self.cwd / 'contaminated').exists())
         self.assertFalse(any(row['caller_module'] == 'leaked-child' for row in second['rows']))
         self.assertFalse(list(self.cwd.glob('dynamic.*.csv')))
-
-    def test_existing_traces_are_neither_collected_nor_deleted(self):
-        existing = self.cwd / 'dynamic.999999.csv'
-        existing.write_text(HEADER + 'unrelated,0x1,target,0x2\n')
-        self.suite([('one', 'ok')])
-        self.assertTrue(existing.exists())
-        with (self.output / 'suite.csv').open() as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertEqual({r['caller_module'] for r in rows}, {'ok'})
 
     def test_reused_pid_name_preserves_old_trace_and_collects_new_trace(self):
         existing = self.cwd / 'dynamic.999999.csv'

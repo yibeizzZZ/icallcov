@@ -82,14 +82,13 @@ def main(argv=None):
     output = resolve_path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     rows = []
-    failed = False
     for target in config['targets']:
         name = target['name']
         directory = output / name
         directory.mkdir(parents=True, exist_ok=True)
         row = {'target': name, 'binary': str(target['binary']), 'status': 'error',
                'raw_static': None, 'static': None, 'covered': None,
-               'uncovered': None, 'coverage': None, 'error': ''}
+               'uncovered': None, 'coverage': None, 'coverage_status': None, 'error': ''}
         print(f'\nTarget: {name} ({target["binary"]})', flush=True)
         # Never consume a summary left behind by a previous failed invocation.
         summary = directory / 'coverage.json'
@@ -123,16 +122,23 @@ def main(argv=None):
                     report_args.extend([flag, value])
             if args.mode == 'edge':
                 report_args.extend(['--show-targets', '--export-edges', directory / 'observed_edges.json'])
-            if invoke('report.py', report_args, 'report.txt'):
+            report_status = invoke('report.py', report_args, 'report.txt')
+            if report_status not in (0, 2) or not summary.is_file():
                 raise RuntimeError('report failed; see report.txt')
             row.update(json.loads(summary.read_text(encoding='utf-8')))
+            if report_status == 2 and row['coverage_status'] != 'indeterminate':
+                raise RuntimeError('report failed; see report.txt')
             row['status'] = 'failed' if suite_status else 'passed'
             if suite_status:
                 row['error'] = 'tests failed; coverage may be partial; see suite/summary.csv'
-            failed |= bool(suite_status)
+            if row['coverage_status'] == 'indeterminate':
+                if not suite_status:
+                    row['status'] = 'indeterminate'
+                row['error'] = (row['error'] + '; ' if row['error'] else '') + (
+                    'no project callsites; check source paths/debug information in report.txt')
         except (OSError, ValueError, RuntimeError) as error:
             row['error'] = str(error)
-            failed = True
+            row['status'] = 'error'
         rows.append(row)
         # Persist progress even if a later target is interrupted.
         (output / 'summary.json').write_text(json.dumps(rows, indent=2) + '\n', encoding='utf-8')
@@ -140,13 +146,14 @@ def main(argv=None):
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
+        coverage_text = 'N/A' if row['coverage'] is None else f'{row["coverage"]:.2f}%'
         print(f'{name}: {row["status"]}, static={row["static"]}, '
               f'covered={row["covered"]}, uncovered={row["uncovered"]}, '
-              f'coverage={row["coverage"]}%', flush=True)
+              f'coverage={coverage_text}', flush=True)
         if row['error']:
             print(row['error'], file=sys.stderr)
     print(f'\nPer-binary summary: {output / "summary.csv"}')
-    return int(failed)
+    return int(any(row['status'] != 'passed' for row in rows))
 
 
 if __name__ == '__main__':

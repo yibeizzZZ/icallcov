@@ -22,7 +22,10 @@ from elf_addresses import elf_image_base
 
 INSTRUCTION_RE = re.compile(
     r"^\s*([0-9a-fA-F]+):\s+"
-    r"(callq?|lcall)\s+"
+    # objdump prints prefixes before the mnemonic. Keep the address of the
+    # whole instruction (including prefixes), matching DynamoRIO's callsite PC.
+    r"((?:(?:notrack|bnd|rep(?:z|nz|e|ne)?|data16|addr32|"
+    r"rex(?:\.[WRXB]+)?|cs|ds|es|fs|gs|ss)\s+)*(?:callq?|lcall))\s+"
     r"(.+?)\s*$"
 )
 

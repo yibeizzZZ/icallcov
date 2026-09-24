@@ -1,6 +1,7 @@
 #include "trace_common.h"
 
 #include <stddef.h>
+#include <string.h>
 
 static file_t log_file = INVALID_FILE;
 
@@ -46,7 +47,21 @@ trace_print_module_offset(file_t file, app_pc pc)
          * address, giving the same offset for PIE and non-PIE binaries.
          * report.py adds that ELF base back only for symbolization. */
         size_t offset = (size_t)(pc - mod->start);
-        dr_fprintf(file, "%s,0x%zx", name != NULL ? name : "<unknown>", offset);
+        if (name == NULL)
+            name = "<unknown>";
+        if (strpbrk(name, ",\"\r\n") == NULL) {
+            dr_fprintf(file, "%s,0x%zx", name, offset);
+        } else {
+            /* CSV fields containing delimiters need quotes; embedded quotes
+             * are doubled. Keep ordinary module names on the single-write path. */
+            dr_fprintf(file, "\"");
+            for (const char *p = name; *p != '\0'; ++p) {
+                if (*p == '"')
+                    dr_fprintf(file, "\"");
+                dr_fprintf(file, "%c", *p);
+            }
+            dr_fprintf(file, "\",0x%zx", offset);
+        }
         dr_free_module_data(mod);
     } else {
         /* Preserve the existing fallback for addresses outside known modules. */
