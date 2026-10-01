@@ -182,7 +182,9 @@ See [examples/libuv.md](examples/libuv.md) for a debug build and a `run_suite.py
 
 An independent [LLVM IR callsite scanner](llvm/README.md) reads `.ll`/`.bc` using `CallBase::isIndirectCall()` and emits artifact-local unique IDs, owning functions, debug source locations, and an explicit `not_analyzed` target-analysis placeholder. It requires LLVM 21.1.x and builds separately. See the linked guide for commands and the sample input.
 
-The existing binary scanner and coverage workflow remain unchanged. IR output is not accepted by `report.py`: static callee estimation and IR-to-runtime address mapping are not implemented yet.
+The existing binary scanner and coverage workflow remain unchanged. IR output is not accepted by `report.py`.
+
+For candidate target sets, the optional [TypeDive integration](docs/typedive.md) reuses upstream FLTA/one-layer/MLTA in a pinned LLVM15 Docker environment and compares them with observed dynamic edges by source location. These are candidate sets, not a sound ground-truth upper bound; dynamic observations remain a confirmed-positive lower bound.
 
 ## Current Limitations
 

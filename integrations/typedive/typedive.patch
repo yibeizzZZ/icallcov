@@ -1,0 +1,99 @@
+diff --git a/src/lib/CallGraph.cc b/src/lib/CallGraph.cc
+index 3ca4e8b..d316850 100644
+--- a/src/lib/CallGraph.cc
++++ b/src/lib/CallGraph.cc
+@@ -91,6 +91,9 @@ void CallGraphPass::doMLTA(Function *F) {
+ 				Ctx->IndirectCallInsts.push_back(CI);
+ 
+ 				ICallSet.insert(CI);
++				if (ENABLE_MLTA <= 1) {
++					printTargets(*FS, CI);
++				}
+ 				if (!FS->empty()) {
+ 					MatchedICallSet.insert(CI);
+ 					Ctx->NumIndirectCallTargets += FS->size();
+diff --git a/src/lib/Common.cc b/src/lib/Common.cc
+index de7ce32..bd4a185 100644
+--- a/src/lib/Common.cc
++++ b/src/lib/Common.cc
+@@ -31,7 +31,7 @@ string getFileName(DILocation *Loc, DISubprogram *SP) {
+ 
+ 	int slashToTrim = 2;
+ 	char *user = getlogin();
+-	if (strstr(user, "kjlu")) {
++	if (user && strstr(user, "kjlu")) {
+ 		slashToTrim = 0;
+ 		trimPathSlash(FN, slashToTrim);
+ 		FN = string(SOURCE_CODE_PATH) + "/" + FN;
+diff --git a/src/lib/MLTA.cc b/src/lib/MLTA.cc
+index 3543461..e91c0ab 100644
+--- a/src/lib/MLTA.cc
++++ b/src/lib/MLTA.cc
+@@ -12,6 +12,8 @@
+ #include "llvm/IR/Instruction.h"
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/Support/Debug.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/Path.h"
+ #include "llvm/IR/DebugInfo.h"
+ #include "llvm/IR/InstIterator.h"
+ #include "llvm/IR/Constants.h"
+@@ -798,6 +800,50 @@ void MLTA::printTypeChain(list<typeidx_t> &Chain) {
+ 	OP<<"\n";
+ }
+ 
++// Versioned output only: never changes candidate sets or analysis state.
++static std::string sourcePath(StringRef Directory, StringRef Filename) {
++    if (Filename.empty()) return "";
++    SmallString<256> Path(Filename);
++    if (!sys::path::is_absolute(Path)) {
++        Path = Directory;
++        sys::path::append(Path, Filename);
++    }
++    sys::path::remove_dots(Path, true);
++    return std::string(Path.str());
++}
++
++static void printPair(CallInst *CI, Function *F) {
++    if (!CI) return;
++    // Ordinal among ALL instructions distinguishes void calls, identical IR
++    // text, and multiple inlined callsites sharing a debug source location.
++    int64_t Ordinal = 0;
++    for (auto &I : instructions(CI->getFunction())) {
++        if (&I == CI) break;
++        ++Ordinal;
++    }
++    std::string IR;
++    raw_string_ostream Stream(IR);
++    CI->print(Stream);
++    Stream.flush();
++    auto Loc = CI->getDebugLoc();
++    auto SP = F->getSubprogram();
++    json::Object Pair{
++        {"schema_version", 1}, {"mode", ENABLE_MLTA},
++        {"caller_module", CI->getModule()->getModuleIdentifier()},
++        {"caller_function", CI->getFunction()->getName()},
++        {"caller_instruction", Ordinal}, {"caller_ir", IR},
++        {"caller_file", Loc ? sourcePath(Loc->getDirectory(), Loc->getFilename()) : ""},
++        {"caller_line", Loc ? int64_t(Loc.getLine()) : 0},
++        {"caller_column", Loc ? int64_t(Loc.getCol()) : 0},
++        {"callee_module", F->getParent()->getModuleIdentifier()},
++        {"callee_function", F->getName()},
++        {"callee_file", SP ? sourcePath(SP->getDirectory(), SP->getFilename()) : ""},
++        {"callee_line", SP ? int64_t(SP->getLine()) : 0},
++        {"callee_declaration", F->isDeclaration()}
++    };
++    OP << "ICALLCOV_PAIR_V1\t" << json::Value(std::move(Pair)) << "\n";
++}
++
+ void MLTA::printTargets(FuncSet &FS, CallInst *CI) {
+ 
+ 	if (CI) {
+@@ -810,6 +856,7 @@ void MLTA::printTargets(FuncSet &FS, CallInst *CI) {
+ 	}
+ 	OP<<"\n\t Indirect-call targets: ("<<FS.size()<<")\n";
+ 	for (auto F : FS) {
++		printPair(CI, F);
+ 		if (F->isDeclaration()) {
+ 			OP<<"ERROR: print declaration function: "<<F->getName()<<"\n";
+ 			continue;
